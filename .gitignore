@@ -219,6 +219,13 @@ __marimo__/
 # Streamlit
 .streamlit/secrets.toml
 
-# Retrival  Stuff
+# Retrieval / agent runtime artifacts
 search_cache/
 retrieval_log.csv
+data/retrieval_log.csv
+data/traces/
+data/cache/
+costs.sqlite
+
+# Local SDK reasoning memory (default PA_MEMORY_DIR)
+.pa_memory/

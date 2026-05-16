@@ -1,0 +1,326 @@
+"""Unit tests for agent/stages/risk_action.py.
+
+Phase 3 gate: covers all four caps + the position-flip-as-sell rule +
+the minimum-edge gate + the 14-trade-minimum relaxation.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+from decimal import Decimal
+
+import pytest
+
+from ai_prophet.trade.agent.stages.base import StageResult
+from ai_prophet.trade.core.tick_context import CandidateMarket, Position, TickContext
+
+from agent.settings import RiskConfig, TradingConstraints
+from agent.stages.risk_action import RiskAwareActionStage
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+def _tick_boundary(minutes: int = 15) -> datetime:
+    """Snap to a 15-min boundary (the SDK enforces this in TickContext.__post_init__)."""
+    now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
+    snapped = now.replace(minute=(now.minute // minutes) * minutes)
+    return snapped
+
+
+def make_market(
+    market_id: str,
+    *,
+    question: str = "Q",
+    yes_bid: float = 0.48,
+    yes_ask: float = 0.52,
+    volume_24h: float = 5000.0,
+) -> CandidateMarket:
+    yes_mark = (yes_bid + yes_ask) / 2.0
+    return CandidateMarket(
+        market_id=market_id,
+        question=question,
+        description=None,
+        resolution_time=datetime.now(timezone.utc) + timedelta(days=10),
+        yes_bid=yes_bid,
+        yes_ask=yes_ask,
+        yes_mark=yes_mark,
+        no_bid=1.0 - yes_ask,
+        no_ask=1.0 - yes_bid,
+        no_mark=1.0 - yes_mark,
+        volume_24h=volume_24h,
+        quote_ts=datetime.now(timezone.utc),
+    )
+
+
+def make_position(market_id: str, side: str, shares: float, avg_entry: float) -> Position:
+    return Position(
+        market_id=market_id,
+        side=side,
+        shares=Decimal(str(shares)),
+        avg_entry_price=Decimal(str(avg_entry)),
+        current_price=Decimal(str(avg_entry)),
+        unrealized_pnl=Decimal("0"),
+        realized_pnl=Decimal("0"),
+        updated_at=datetime.now(timezone.utc),
+    )
+
+
+def make_tick(
+    *,
+    candidates: list[CandidateMarket],
+    positions: list[Position] | None = None,
+    cash: float = 10000.0,
+    equity: float = 10000.0,
+    total_fills: int = 50,
+) -> TickContext:
+    tick_ts = _tick_boundary()
+    return TickContext(
+        run_id="test:0",
+        tick_ts=tick_ts,
+        data_asof_ts=tick_ts,
+        candidate_set_id="cs_test",
+        submission_deadline=tick_ts + timedelta(minutes=9),
+        server_now=tick_ts,
+        candidates=tuple(candidates),
+        cash=Decimal(str(cash)),
+        equity=Decimal(str(equity)),
+        total_pnl=Decimal("0"),
+        positions=tuple(positions or []),
+        total_fills=total_fills,
+    )
+
+
+def forecast_result(forecasts: dict[str, dict]) -> dict[str, StageResult]:
+    return {
+        "forecast": StageResult(
+            stage_name="forecast",
+            success=True,
+            data={"forecasts": forecasts},
+        ),
+    }
+
+
+def make_stage(**risk_overrides) -> RiskAwareActionStage:
+    risk = RiskConfig(**risk_overrides) if risk_overrides else RiskConfig()
+    return RiskAwareActionStage(
+        llm_client=None,
+        constraints=TradingConstraints(),
+        risk=risk,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Edge gate
+# ---------------------------------------------------------------------------
+
+def test_no_intent_when_edge_below_min():
+    # market: ask 0.52, p_yes 0.54 -> edge 0.02 < default 0.05.
+    m = make_market("M1", yes_bid=0.48, yes_ask=0.52)
+    tick = make_tick(candidates=[m])
+    forecasts = {"M1": {"p_yes": 0.54, "rationale": "tiny edge"}}
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result(forecasts))
+
+    assert out.success
+    assert out.data["intents"] == []
+
+
+def test_buy_yes_when_edge_clears_threshold():
+    # ask 0.40, p_yes 0.60 -> edge 0.20, well over 0.05.
+    m = make_market("M1", yes_bid=0.36, yes_ask=0.40)
+    tick = make_tick(candidates=[m])
+    forecasts = {"M1": {"p_yes": 0.60, "rationale": "real edge"}}
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result(forecasts))
+
+    intents = out.data["intents"]
+    assert len(intents) == 1
+    assert intents[0]["action"] == "BUY"
+    assert intents[0]["side"] == "YES"
+    assert float(intents[0]["shares"]) > 0
+
+
+def test_buy_no_when_negative_yes_edge_but_positive_no_edge():
+    # ask 0.80 (high), p_yes 0.30 -> NO ask = 1 - 0.20 = 0.20.
+    # p_no = 0.70, edge_no = 0.70 - 0.20 = 0.50.
+    m = make_market("M1", yes_bid=0.78, yes_ask=0.80)
+    tick = make_tick(candidates=[m])
+    forecasts = {"M1": {"p_yes": 0.30, "rationale": "no side"}}
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result(forecasts))
+
+    intents = out.data["intents"]
+    assert len(intents) == 1
+    assert intents[0]["side"] == "NO"
+
+
+# ---------------------------------------------------------------------------
+# Sizing caps
+# ---------------------------------------------------------------------------
+
+def test_size_capped_by_max_position_pct_of_equity():
+    # Massive edge would otherwise size higher; we cap at 5% of $10k = $500.
+    m = make_market("M1", yes_bid=0.05, yes_ask=0.10)
+    tick = make_tick(candidates=[m], equity=10_000.0)
+    forecasts = {"M1": {"p_yes": 0.95, "rationale": "huge edge"}}
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result(forecasts))
+    decisions = out.data["decisions"]
+    assert decisions["M1"]["size_usd"] <= 500.0 + 1e-6
+
+
+def test_size_capped_by_max_notional_per_market_with_large_equity():
+    # With huge equity, the 5% cap = $50k, so the $1k per-market cap binds.
+    m = make_market("M1", yes_bid=0.05, yes_ask=0.10)
+    tick = make_tick(candidates=[m], equity=1_000_000.0)
+    forecasts = {"M1": {"p_yes": 0.95, "rationale": "huge edge"}}
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result(forecasts))
+    decisions = out.data["decisions"]
+    assert decisions["M1"]["size_usd"] <= 1000.0 + 1e-6
+
+
+def test_gross_exposure_cap_skips_later_intents():
+    # 11 markets each priced cheap with full $1k size would total $11k.
+    # MAX_GROSS_EXPOSURE = $10k -> last one should be trimmed or skipped.
+    markets = [
+        make_market(f"M{i}", yes_bid=0.05, yes_ask=0.10) for i in range(12)
+    ]
+    tick = make_tick(candidates=markets, equity=1_000_000.0)
+    forecasts = {f"M{i}": {"p_yes": 0.95, "rationale": "edge"} for i in range(12)}
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result(forecasts))
+    total = sum(d["size_usd"] for d in out.data["decisions"].values())
+    assert total <= 10_000.0 + 1e-6
+
+
+# ---------------------------------------------------------------------------
+# Position caps
+# ---------------------------------------------------------------------------
+
+def test_skips_new_position_when_at_max_open_positions():
+    # 30 existing positions; new opportunity in M31 must be skipped.
+    existing = [make_position(f"H{i}", "YES", 10.0, 0.5) for i in range(30)]
+    new_market = make_market("M_NEW", yes_bid=0.36, yes_ask=0.40)
+    tick = make_tick(
+        candidates=[new_market],
+        positions=existing,
+        equity=1_000_000.0,
+    )
+    forecasts = {"M_NEW": {"p_yes": 0.60, "rationale": ""}}
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result(forecasts))
+    assert out.data["intents"] == []
+
+
+def test_max_trades_per_tick_truncates():
+    # 25 fresh markets with strong edge but tiny equity so per-position cap
+    # keeps each trade small enough that MAX_GROSS_EXPOSURE doesn't bind
+    # first: equity=$5k -> 5% cap = $250/trade, 25*$250=$6.25k < $10k cap,
+    # so MAX_TRADES_PER_TICK=20 should be the binding limit.
+    markets = [
+        make_market(f"M{i}", yes_bid=0.36, yes_ask=0.40) for i in range(25)
+    ]
+    tick = make_tick(candidates=markets, equity=5_000.0)
+    forecasts = {f"M{i}": {"p_yes": 0.60, "rationale": ""} for i in range(25)}
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result(forecasts))
+    assert len(out.data["intents"]) == 20  # MAX_TRADES_PER_TICK
+
+
+# ---------------------------------------------------------------------------
+# Position-flip-as-sell rule
+# ---------------------------------------------------------------------------
+
+def test_position_flip_emits_sell_on_held_side():
+    # Hold YES, but forecast now prefers NO -> emit SELL YES, not BUY NO.
+    m = make_market("M1", yes_bid=0.78, yes_ask=0.80)
+    held = make_position("M1", "YES", shares=50.0, avg_entry=0.50)
+    tick = make_tick(candidates=[m], positions=[held])
+    forecasts = {"M1": {"p_yes": 0.20, "rationale": "flip"}}
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result(forecasts))
+
+    intents = out.data["intents"]
+    assert len(intents) == 1
+    assert intents[0]["action"] == "SELL"
+    assert intents[0]["side"] == "YES"
+    assert float(intents[0]["shares"]) == 50.0
+    decision = out.data["decisions"]["M1"]
+    assert decision["is_position_flip"] is True
+
+
+def test_no_flip_when_already_aligned():
+    # Hold YES, forecast still prefers YES -> standard BUY YES (sizing path).
+    m = make_market("M1", yes_bid=0.36, yes_ask=0.40)
+    held = make_position("M1", "YES", shares=20.0, avg_entry=0.30)
+    tick = make_tick(candidates=[m], positions=[held])
+    forecasts = {"M1": {"p_yes": 0.60, "rationale": "still good"}}
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result(forecasts))
+    intents = out.data["intents"]
+    assert len(intents) == 1
+    assert intents[0]["action"] == "BUY"
+    assert intents[0]["side"] == "YES"
+
+
+# ---------------------------------------------------------------------------
+# 14-trade-minimum guard
+# ---------------------------------------------------------------------------
+
+def test_min_edge_relaxed_when_under_trade_floor():
+    # Default min_edge 0.05 would reject p_yes 0.44 vs ask 0.40 (edge 0.04).
+    # With total_fills=0 (under floor 14), min_edge_relaxed 0.03 applies and 0.04 passes.
+    m = make_market("M1", yes_bid=0.36, yes_ask=0.40)
+    tick = make_tick(candidates=[m], total_fills=0)
+    forecasts = {"M1": {"p_yes": 0.44, "rationale": ""}}
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result(forecasts))
+    assert len(out.data["intents"]) == 1
+
+
+def test_min_edge_not_relaxed_when_at_or_above_floor():
+    # Same edge 0.04 fails the default min_edge 0.05 when total_fills >= floor.
+    m = make_market("M1", yes_bid=0.36, yes_ask=0.40)
+    tick = make_tick(candidates=[m], total_fills=14)
+    forecasts = {"M1": {"p_yes": 0.44, "rationale": ""}}
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result(forecasts))
+    assert out.data["intents"] == []
+
+
+# ---------------------------------------------------------------------------
+# Edge cases
+# ---------------------------------------------------------------------------
+
+def test_below_min_intent_size_skipped():
+    # Tiny equity + tight edge -> Kelly fraction yields a sub-$5 trade -> skip.
+    m = make_market("M1", yes_bid=0.48, yes_ask=0.50)
+    tick = make_tick(candidates=[m], equity=10.0)
+    forecasts = {"M1": {"p_yes": 0.60, "rationale": ""}}
+
+    stage = make_stage(min_intent_size_usd=5.0)
+    out = stage.execute(tick, forecast_result(forecasts))
+    assert out.data["intents"] == []
+
+
+def test_no_forecasts_returns_empty_success():
+    tick = make_tick(candidates=[])
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result({}))
+    assert out.success
+    assert out.data["intents"] == []

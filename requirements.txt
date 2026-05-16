@@ -1,0 +1,33 @@
+# Prophet Hacks 2026 - Trading Track submission
+#
+# Top-level dependency manifest for graders. Install with:
+#   pip install -r requirements.txt
+#
+# The two `ai-prophet*` packages are installed from the vendored sources under
+# `packages/` so the grader gets the exact SDK version we built against.
+
+-e ./packages/core
+-e ./packages/cli
+
+# Retrieval pipeline
+tavily-python>=0.7.0
+diskcache>=5.6.3
+duckduckgo-search>=6.0.0
+httpx>=0.27.0
+
+# LLM SDKs (used directly by retrieval and by the SDK's create_llm_client)
+openai>=1.40.0
+anthropic>=0.40.0
+google-genai>=0.3.0
+
+# Config + utilities
+python-dotenv>=1.0.1
+pydantic>=2.7.0
+
+# Pinned transitive deps for FastAPI-based example_agent (not used in trading,
+# but the SDK imports it in places and missing deps break `prophet --help`).
+fastapi>=0.111.0
+uvicorn>=0.30.0
+
+# Dev/test
+pytest>=8.2.0
