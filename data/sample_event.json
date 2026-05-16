@@ -1,0 +1,10 @@
+{
+  "event_id": "EVT_SAMPLE_001",
+  "title": "Will country X hold an election by March 2026?",
+  "markets": ["Yes", "No"],
+  "rules": "Resolves YES if a general or presidential election is officially announced by March 31, 2026.",
+  "market_stats": {
+    "Yes": {"last_price": 0.72, "yes_ask": 0.73, "no_ask": 0.28},
+    "No": {"last_price": 0.28, "yes_ask": 0.27, "no_ask": 0.72}
+  }
+}

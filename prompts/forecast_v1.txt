@@ -1,0 +1,2 @@
+Given the event title, resolution rules, market stats, and news context, reason step by step then output JSON:
+{"prediction": {"YES": <float>, "NO": <float>}, "rationale": "<one sentence>"}

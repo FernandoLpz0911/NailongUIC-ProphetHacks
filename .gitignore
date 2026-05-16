@@ -1,0 +1,19 @@
+.env
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+*.sqlite
+costs.sqlite
+
+# Generated at runtime (commit sample_event.json only)
+data/events.json
+data/submission.json
+data/events_test.json
+
+# Submission artifact
+submission.zip
