@@ -1,0 +1,13 @@
+{
+  "events_per_day": 20,
+  "days": 10,
+  "total_events": 200,
+  "avg_cost_per_event_usd": 0.004469,
+  "projected_spend_usd": 0.8938,
+  "measured_spend_usd": 0.0045,
+  "cost_db": "costs.sqlite",
+  "distinct_events_in_db": 1,
+  "cost_records_in_db": 3,
+  "over_budget_warning": false,
+  "budget_warn_threshold_usd": 150.0
+}

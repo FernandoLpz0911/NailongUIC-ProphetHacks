@@ -1,2 +1,14 @@
-Given the event title, resolution rules, market stats, and news context, reason step by step then output JSON:
-{"prediction": {"YES": <float>, "NO": <float>}, "rationale": "<one sentence>"}
+Analyze the event for the Trading Track.
+
+Steps:
+1. State the base rate implied by market_stats (yes_ask / no_ask midpoint).
+2. List 2-3 pieces of evidence from the news context that should update that probability.
+3. Produce a final probability for YES.
+
+Output JSON exactly:
+{
+  "prediction": {"YES": <float 0-1>, "NO": <float 0-1>},
+  "rationale": "<one sentence>"
+}
+
+Constraints: YES + NO must equal 1.0. Avoid 0.99 or 0.01 unless evidence is overwhelming.

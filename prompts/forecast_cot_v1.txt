@@ -1,0 +1,23 @@
+This is a hard / uncertain event. Use structured chain-of-thought before your final probability.
+
+Work through these steps explicitly in your reasoning (you may include brief reasoning text, but the response must still be JSON only):
+
+1. **Base rate** — State the market-implied probability from market_stats (yes_ask / no_ask midpoint). This is your starting point.
+
+2. **Resolution criteria** — In one sentence, what exactly must happen for YES? Note any ambiguity in the rules.
+
+3. **Evidence for YES** — List up to 3 concrete facts from the news context that would raise P(YES).
+
+4. **Evidence for NO** — List up to 3 concrete facts from the news context that would lower P(YES).
+
+5. **Net update** — Given base rate and evidence, how many percentage points should P(YES) move up or down? Stay conservative unless evidence is strong.
+
+6. **Final probability** — Produce calibrated YES / NO that sum to 1.0. Avoid 0.99 or 0.01 unless evidence is overwhelming.
+
+Output JSON exactly:
+{
+  "prediction": {"YES": <float 0-1>, "NO": <float 0-1>},
+  "rationale": "<one sentence summarizing base rate → update → final>"
+}
+
+Constraints: YES + NO must equal 1.0.

@@ -5,7 +5,40 @@ from typing import Any
 
 import httpx
 
-from agent.config import DEFAULT_MODEL, FALLBACK_MODELS, OPENROUTER_API_KEY, OPENROUTER_BASE_URL
+from agent.config import (
+    DEFAULT_MODEL,
+    FALLBACK_MODELS,
+    OPENROUTER_API_KEY,
+    OPENROUTER_BASE_URL,
+    USE_PROMPT_CACHE,
+)
+
+
+def _apply_prompt_cache(messages: list[dict[str, str]]) -> list[dict]:
+    """Best-effort Anthropic-style cache breakpoints on static system prompts."""
+    if not USE_PROMPT_CACHE:
+        return messages
+
+    cached: list[dict] = []
+    for message in messages:
+        role = message.get("role")
+        content = message.get("content")
+        if role == "system" and isinstance(content, str) and content.strip():
+            cached.append(
+                {
+                    "role": "system",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": content,
+                            "cache_control": {"type": "ephemeral"},
+                        }
+                    ],
+                }
+            )
+        else:
+            cached.append(dict(message))
+    return cached
 
 
 class OpenRouterClient:
@@ -30,16 +63,27 @@ class OpenRouterClient:
         model: str | None = None,
         temperature: float = 0.2,
         max_tokens: int = 2048,
+        timeout: float = 120.0,
     ) -> dict[str, Any]:
         if not self.api_key:
             raise RuntimeError("OPENROUTER_API_KEY is not set")
 
         models = [model or self.default_model, *self.fallback_models]
         last_error: Exception | None = None
+        outbound_messages = _apply_prompt_cache(messages)
+        request_body: dict[str, Any] = {
+            "model": models[0],
+            "messages": outbound_messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        if USE_PROMPT_CACHE:
+            request_body["provider"] = {"order": ["Anthropic"], "allow_fallbacks": True}
 
-        async with httpx.AsyncClient(timeout=120.0) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             for candidate in models:
                 try:
+                    body = {**request_body, "model": candidate}
                     response = await client.post(
                         f"{self.base_url}/chat/completions",
                         headers={
@@ -48,12 +92,7 @@ class OpenRouterClient:
                             "HTTP-Referer": os.getenv("OPENROUTER_HTTP_REFERER", "https://github.com"),
                             "X-Title": os.getenv("OPENROUTER_APP_NAME", "prophet-hacks-agent"),
                         },
-                        json={
-                            "model": candidate,
-                            "messages": messages,
-                            "temperature": temperature,
-                            "max_tokens": max_tokens,
-                        },
+                        json=body,
                     )
                     response.raise_for_status()
                     payload = response.json()
@@ -66,8 +105,12 @@ class OpenRouterClient:
 
     @staticmethod
     def extract_text(payload: dict[str, Any]) -> str:
-        choices = payload.get("choices") or []
-        if not choices:
-            return ""
-        message = choices[0].get("message") or {}
-        return str(message.get("content") or "")
+        return extract_message_text(payload)
+
+
+def extract_message_text(payload: dict[str, Any]) -> str:
+    choices = payload.get("choices") or []
+    if not choices:
+        return ""
+    message = choices[0].get("message") or {}
+    return str(message.get("content") or "")

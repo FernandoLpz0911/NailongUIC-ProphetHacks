@@ -5,13 +5,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 from pathlib import Path
 
 from agent.config import DATA_DIR
-from agent.schemas import MarketStat, Prediction
+from agent.schemas import Prediction
 from eval.harness import load_events
-from eval.metrics import brier_score
-from eval.simulator import simulate_return
+from eval.scoring import aggregate_scores, outcome_yes, score_one
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+logger = logging.getLogger(__name__)
 
 
 def main() -> None:
@@ -39,32 +42,33 @@ def main() -> None:
         print(f"No predictions at {args.predictions} — generate via harness after /predict runs.")
         return
 
-    preds = json.loads(args.predictions.read_text(encoding="utf-8"))
-    brier_total = 0.0
-    return_total = 0.0
-    count = 0
-
-    for row in preds:
+    preds_rows = json.loads(args.predictions.read_text(encoding="utf-8"))
+    predictions_by_id: dict[str, Prediction] = {}
+    for row in preds_rows:
         event_id = row["event_id"]
         event = events.get(event_id)
         if not event:
             continue
-        outcome_yes = bool(event.get("outcome_yes") or event.get("resolved_yes"))
         pred = Prediction.model_validate(row["prediction"])
-        stats = {
-            k: MarketStat.model_validate(v) for k, v in (event.get("market_stats") or {}).items()
-        }
-        brier_total += brier_score(pred.YES, outcome_yes)
-        return_total += simulate_return(pred, stats, outcome_yes=outcome_yes)
-        count += 1
+        predictions_by_id[event_id] = pred
+        brier, ret = score_one(pred, event)
+        logger.info(
+            "event_id=%s brier=%.4f return=%.4f outcome_yes=%s",
+            event_id,
+            brier,
+            ret,
+            outcome_yes(event),
+        )
 
+    scores = aggregate_scores(events, predictions_by_id)
+    count = int(scores["count"])
     if count == 0:
         print("No overlapping event_ids between events and predictions.")
         return
 
     print(f"events_scored={count}")
-    print(f"brier={brier_total / count:.4f}")
-    print(f"avg_return_proxy={return_total / count:.4f}")
+    print(f"brier={scores['brier']:.4f}")
+    print(f"avg_return_proxy={scores['avg_return']:.4f}")
 
 
 if __name__ == "__main__":
