@@ -218,3 +218,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Retrival  Stuff
+search_cache/
+retrieval_log.csv
