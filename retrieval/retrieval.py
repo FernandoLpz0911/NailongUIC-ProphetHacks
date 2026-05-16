@@ -8,10 +8,9 @@ from tavily import TavilyClient
 from openai import OpenAI
 import csv
 from pathlib import Path
-
+## For this to work you have to make a .env file with your API keys
 load_dotenv()
 
-# --- Clients ---
 cache         = diskcache.Cache("./search_cache")
 tavily_client = TavilyClient(api_key=os.getenv("TAVILY_API_KEY"))
 router        = OpenAI(
@@ -19,25 +18,18 @@ router        = OpenAI(
     base_url="https://openrouter.ai/api/v1"
 )
 
-# ---------------------------------------------------------------------------
-# Stage 3 — Source quality tiers
-# ---------------------------------------------------------------------------
+
 
 HIGH_QUALITY_DOMAINS = {
-    # Wire / general news
+    
     "reuters.com", "apnews.com", "axios.com",
     "bbc.com", "bbc.co.uk", "npr.org",
-    # Finance
     "bloomberg.com", "ft.com", "wsj.com",
     "federalreserve.gov", "sec.gov", "treasury.gov",
-    # Politics
     "politico.com", "thehill.com", "rollcall.com",
     "whitehouse.gov", "congress.gov",
-    # Crypto
     "coindesk.com", "cointelegraph.com", "decrypt.co",
-    # Sports
     "espn.com", "nba.com", "nfl.com", "mlb.com", "fifa.com",
-    # Government / international
     "europa.eu", "un.org", "who.int", "nih.gov", "cdc.gov"
 }
 
@@ -48,9 +40,6 @@ BLOCKED_DOMAINS = {
     "tmz.com", "answers.yahoo.com"
 }
 
-# ---------------------------------------------------------------------------
-# Stage 4 — Per-category retrieval profiles
-# ---------------------------------------------------------------------------
 
 CATEGORY_PROFILES = {
     "crypto": {
@@ -152,15 +141,13 @@ def log_to_csv(result: dict) -> None:
     print(f"[csv log]    {result['event_id']} -> {CSV_LOG}")
 
 
-# ===========================================================================
-# Main entry point
-# ===========================================================================
+
 
 def get_context(
     event_id: str,
     title: str,
     rules: str,
-    resolution_date: str | None = None   # ISO date string e.g. "2026-06-01"
+    resolution_date: str | None = None   
 ) -> dict:
     """
     Main entry point for P3's forecaster.
@@ -229,9 +216,7 @@ def get_context(
     return result
 
 
-# ===========================================================================
-# Stage 4 — Category detection
-# ===========================================================================
+
 
 def detect_category(title: str) -> str:
     """Keyword-based category detection from event title."""
@@ -244,9 +229,7 @@ def detect_category(title: str) -> str:
     return "general"
 
 
-# ===========================================================================
-# Stage 2 — Query generation
-# ===========================================================================
+
 
 def generate_queries(title: str, rules: str) -> list[str]:
     """
@@ -273,9 +256,7 @@ def generate_queries(title: str, rules: str) -> list[str]:
     return [title]
 
 
-# ===========================================================================
-# Stage 5 — Search with DuckDuckGo fallback
-# ===========================================================================
+
 
 def fetch_with_fallback(queries: list[str]) -> list[dict]:
     """
@@ -298,7 +279,7 @@ def fetch_with_fallback(queries: list[str]) -> list[dict]:
                 print(f"[tavily err] '{query}' -> {e}. Switching to DuckDuckGo.")
                 tavily_failed = True
 
-        # DuckDuckGo fallback
+        
         try:
             from duckduckgo_search import DDGS
             with DDGS() as ddgs:
@@ -315,9 +296,7 @@ def fetch_with_fallback(queries: list[str]) -> list[dict]:
     return chunks
 
 
-# ===========================================================================
-# Stage 3 — Source filtering, recency boost, sorting
-# ===========================================================================
+
 
 def get_domain(url: str) -> str:
     try:
@@ -331,7 +310,7 @@ def is_high_quality(domain: str) -> bool:
         return False
     if domain in HIGH_QUALITY_DOMAINS:
         return True
-    # Catch subdomains e.g. data.reuters.com
+   
     return any(domain.endswith("." + hq) for hq in HIGH_QUALITY_DOMAINS)
 
 
@@ -427,9 +406,6 @@ def format_chunk(c: dict) -> dict:
     }
 
 
-# ===========================================================================
-# Stage 3 — Polymarket market history
-# ===========================================================================
 
 def fetch_polymarket(title: str) -> dict | None:
     try:
@@ -448,7 +424,6 @@ def fetch_polymarket(title: str) -> dict | None:
         top    = markets[0]
         prices = top.get("outcomePrices", [None, None])
 
-        # Polymarket returns prices as a JSON string e.g. '["0.62", "0.38"]'
         if isinstance(prices, str):
             try:
                 prices = json.loads(prices)
@@ -469,9 +444,6 @@ def fetch_polymarket(title: str) -> dict | None:
         return None
 
 
-# ===========================================================================
-# Stage 3 — Confidence scoring (source-quality aware)
-# ===========================================================================
 
 def compute_confidence(chunks: list[dict]) -> str:
     """
@@ -498,9 +470,6 @@ def compute_confidence(chunks: list[dict]) -> str:
     return "low"
 
 
-# ===========================================================================
-# Stage 5 — Cache prewarm
-# ===========================================================================
 
 def prewarm_cache(events: list[dict]) -> None:
     """
