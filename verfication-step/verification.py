@@ -17,8 +17,11 @@ def verify(json_payload):
   # Parse the string into a Python dict
   try:
     data = json.loads(json_payload)
-  except json.JSONDecodeError:
-    raise ValueError("Invalid JSON format")
+  except:
+    raise ValueError("Invalid JSON Format")
+    
+  if "prediction" not in data or "event_id" not in data or "rationale" not in data:
+    return "Invalid JSON Format"
 
   yes_prob = data.get("prediction", {}).get("Yes", 0.0)
   no_prob = data.get("prediction", {}).get("No", 0.0)
