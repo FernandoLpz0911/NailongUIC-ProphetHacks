@@ -1,0 +1,22 @@
+Category,Rule_or_Constant,Value,Description
+Constant,TICK_INTERVAL_SECONDS,900,15 min between ticks [cite: 115]
+Constant,TICK_SUBMISSION_DEADLINE_SECS,540,Server rejects submits past tick_ts + 9 min (HTTP 409) [cite: 119]
+Constant,INITIAL_CASH,$10000,Starting bankroll per participant [cite: 119]
+Constant,MAX_TRADES_PER_TICK,20,Fills above this in a single tick get rejected [cite: 119]
+Constant,MAX_TRADES_PER_DAY,100,Fills above this in a 24h rolling window get rejected [cite: 119]
+Constant,MAX_OPEN_POSITIONS,30,"Distinct (market_id, side) positions you can hold [cite: 119]"
+Constant,MAX_NOTIONAL_PER_MARKET,$1000,Exposure cap per market [cite: 119]
+Constant,MAX_GROSS_EXPOSURE,$10000,Total exposure cap [cite: 119]
+Constant,MAX_INTENTS_PER_TICK_REQUEST,50,"HTTP request shape cap; only the first 20 fill [cite: 119]"
+Constant,FEE_RATE,0.0,No trading fees [cite: 119]
+Execution,FILL_PRICE_BUY_YES,best_ask,BUY YES fills at best_ask [cite: 122]
+Execution,FILL_PRICE_SELL_YES,best_bid,SELL YES (or BUY NO) fills at best_bid [cite: 122]
+Execution,POSITION_KEY_STRUCTURE,"(market_id, side)","Positions are keyed by market_id and side; stacking shares accumulates into one position with a blended avg_entry_price [cite: 123]"
+Execution,OPPOSITE_SIDE_HOLDING_LIMIT,None,You cannot hold both YES and NO on the same market [cite: 124]
+Execution,POSITION_REDUCTION_LOGIC,None,"Submitting a BUY on the opposite side of a held position reduces the existing position rather than opening a second one or rejecting the trade [cite: 125]"
+Execution,UNFILLED_OPPOSITE_SHARES,Drop,"Shares get netted off until holding reaches zero; any remaining shares from the intent are dropped and do not flip the position [cite: 126]"
+Execution,POSITION_FLIP_SEQUENCE,SELL then BUY,To flip to the other side you must first SELL down to flat and then BUY the new side in a follow-up intent [cite: 127]
+Execution,UNREALIZED_PNL,mark-to-market,Unrealized PnL is mark-to-market at the snapshot's mid-price for open positions [cite: 128]
+Execution,REALIZED_PNL_WIN,$1,Payouts are $1 per share on the winning side when the market resolves [cite: 129]
+Execution,REALIZED_PNL_LOSS,$0,Payouts are $0 on the losing side when the market resolves [cite: 129]
+Execution,UNIQUE_PROCESS_SLUG,Unique,"(owner_subject, slug) is unique; two processes using the same slug will fight over the tick lease and both will lose [cite: 131, 132]"
