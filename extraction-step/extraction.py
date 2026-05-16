@@ -1,105 +1,333 @@
-"""Extraction and hypothesis generation module for Prophet Hacks 2026."""
+"""
+Hypothesis stage for the Prophet trading agent.
 
-import json
-import re
+Pipeline position: step 2 of 3
+  Extraction → Retrieval → [Hypothesis] → Verify
 
-FORECASTER_SYSTEM_PROMPT = """
-You are an elite quantitative forecaster in a high-stakes prediction market.
-Your goal is to predict the true probability of future events resolving
-as 'Yes' or 'No'.
+Adapts the forecaster prompt from the team's original design to the
+Trading Track market format (FilteredMarket from extraction.py).
 
-IMPORTANT SCORING RULE:
-You are scored on Average Return against the current market consensus
-(last_price).
-- If the retrieved context gives you NO clear informational edge, you MUST
-  anchor your prediction to the current market probabilities to minimize risk.
-- If you have strong, verifiable evidence that contradicts the market, you
-  may deviate, but avoid extreme overconfidence (never predict 1.0 or 0.0).
-  Cap your deviation from the market at 0.30.
-
-INSTRUCTIONS:
-1. Read the Event Title and Resolution Rules carefully.
-2. Analyze the Retrieved News Context. Weigh recent and credible sources.
-3. Observe the current Market Stats (consensus).
-4. Reason step-by-step to form your hypothesis (Base rate -> Evidence ->
-   Adjustment -> Final Probability).
-5. Output your final answer STRICTLY as a valid JSON object matching the
-   required schema.
-
-REQUIRED JSON SCHEMA:
+JSON schema produced by this stage:
 {
-  "event_id": "EVT_1234",
-  "prediction": {
-    "Yes": 0.55,
-    "No": 0.45
-  },
-  "rationale": "A single, concise sentence summarizing the strongest evidence."
+  "market_id": "kalshi:KXBTCMAX100-26-DEC",
+  "estimated_probability": 0.61,
+  "confidence": "high" | "medium" | "low",
+  "reasoning": "step-by-step reasoning...",
+  "sources_used": ["reuters.com/...", "apnews.com/..."]
 }
 """
 
+from __future__ import annotations
 
-def build_user_prompt(event_payload: dict, retrieved_context: str) -> str:
-    """Construct user prompt combining event JSON and retrieved context."""
-    context_str = (
-        retrieved_context
-        if retrieved_context
-        else "No specific news found. Rely on base rates and market stats."
-    )
+import json
+import logging
+import re
 
+import httpx
+from pydantic import BaseModel
+
+from prophet_agent.constants import HYPOTHESIS_MIN_EDGE
+from prophet_agent.extraction import FilteredMarket
+from prophet_agent.retrieval import RetrievalResult, build_context_string, run_retrieval
+
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Output schema
+# ---------------------------------------------------------------------------
+
+class HypothesisResult(BaseModel):
+    """
+    Probability estimate for a single market.
+
+    JSON schema (what Claude must return):
+    {
+      "market_id": "kalshi:KXBTCMAX100-26-DEC",
+      "estimated_probability": 0.61,
+      "confidence": "high",
+      "reasoning": "step-by-step reasoning...",
+      "sources_used": ["reuters.com: ...", "apnews.com: ..."]
+    }
+    """
+
+    market_id: str
+    question: str
+    market_ask: float
+    market_bid: float
+    estimated_probability: float   # Our estimate of true YES probability (0.01–0.99)
+    edge: float                    # estimated_probability - market_ask (positive = BUY YES)
+    confidence: str                # "high" | "medium" | "low"
+    reasoning: str
+    sources_used: list[str]
+    retry_count: int = 0
+
+
+# ---------------------------------------------------------------------------
+# System prompt (adapted from team forecaster prompt — Trading Track format)
+# ---------------------------------------------------------------------------
+
+_SYSTEM_PROMPT = """You are an elite quantitative forecaster specializing in \
+binary prediction markets. Markets pay $1 if YES resolves, $0 if NO.
+
+CRITICAL SCORING RULE:
+You are scored on PnL against the current market price (best_ask).
+- If retrieved context gives NO clear informational edge, anchor your \
+estimate to the market price to minimize risk.
+- If you have strong, verifiable evidence that contradicts the market, \
+deviate — but never exceed 0.30 deviation from market price unless \
+retrieval confidence is very high.
+- Never output 0.0 or 1.0. Cap range at 0.01 to 0.99.
+
+REASONING PROCESS:
+1. Read the market question and resolution criteria carefully.
+2. Observe the current market price (best_ask) — this is the crowd consensus.
+3. Analyze the retrieved news context. Weight recent, credible sources higher.
+4. Reason step by step:
+   Base rate → Evidence review → Market comparison → Final adjustment
+5. Output ONLY a valid JSON object matching the required schema.
+
+REQUIRED JSON SCHEMA:
+{
+  "market_id": "<string>",
+  "estimated_probability": <float 0.01-0.99>,
+  "confidence": "<high|medium|low>",
+  "reasoning": "<step-by-step reasoning, 3-5 sentences>",
+  "sources_used": ["<source 1 description>", "<source 2 description>"]
+}
+
+CONFIDENCE GUIDE:
+  high   — strong recent evidence, clear resolution criteria, low ambiguity
+  medium — mixed evidence or moderate uncertainty in resolution criteria
+  low    — sparse evidence, ambiguous outcome, or fast-changing situation
+
+OUTPUT ONLY RAW JSON — no markdown, no backticks, no preamble."""
+
+
+# ---------------------------------------------------------------------------
+# User prompt builder (Trading Track format)
+# ---------------------------------------------------------------------------
+
+def build_user_prompt(market: FilteredMarket, context_string: str) -> str:
+    """
+    Construct the hypothesis user prompt.
+
+    Combines Trading Track market fields (from FilteredMarket) with
+    retrieved news context. Mirrors the structure of the team's original
+    build_user_prompt() but uses the SDK market format.
+    """
     return (
-        f"EVENT DETAILS:\n"
-        f"Title: {event_payload.get('title')}\n"
-        f"Event ID: {event_payload.get('event_id')}\n"
-        f"Rules: {event_payload.get('rules')}\n\n"
-        f"CURRENT MARKET STATS:\n"
-        f"{event_payload.get('market_stats')}\n\n"
+        f"MARKET DETAILS:\n"
+        f"Market ID:       {market.market_id}\n"
+        f"Question:        {market.question}\n"
+        f"Current ask:     {market.best_ask:.2f}  (cost to buy YES — crowd consensus)\n"
+        f"Current bid:     {market.best_bid:.2f}  (cost to buy NO reversed)\n"
+        f"Bid-ask spread:  {market.spread:.2f}\n"
+        f"24h volume:      ${market.volume_24h:,.0f}\n"
+        f"Resolves:        {market.resolution_time}\n\n"
         f"RETRIEVED NEWS CONTEXT:\n"
-        f"{context_str}\n\n"
-        f"Formulate your hypothesis. Provide your reasoning, then output "
-        f"the final JSON block. Do not include markdown formatting like "
-        f"```json in the final output, just the raw JSON string at the end."
+        f"{context_string}\n\n"
+        f"Formulate your hypothesis using the reasoning process above.\n"
+        f"Output ONLY the raw JSON object — no markdown, no backticks."
     )
 
 
-def extract_and_validate_prediction(
-    llm_response: str, fallback_event_id: str, market_stats: dict
-) -> dict:
-    """Extract and validate JSON from the LLM response."""
+# ---------------------------------------------------------------------------
+# JSON extraction + validation (adapted from team's extract_and_validate_prediction)
+# ---------------------------------------------------------------------------
+
+def extract_and_validate(
+    llm_response: str,
+    market: FilteredMarket,
+) -> dict | None:
+    """
+    Extract and validate the JSON block from the LLM response.
+
+    Handles:
+    - JSON embedded in conversational text (regex extraction)
+    - Probabilities outside [0.01, 0.99] (clamped)
+    - Missing fields (returns None → triggers retry or skip)
+
+    Returns parsed dict on success, None on unrecoverable failure.
+    """
     try:
-        # Regex to find JSON block even if conversational text is present
-        json_match = re.search(r"\{.*\}", llm_response, re.DOTALL)
+        # Strip markdown fences if present
+        cleaned = re.sub(r"```(?:json)?", "", llm_response).strip()
+
+        # Find the outermost JSON object
+        json_match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if not json_match:
-            raise ValueError("No JSON object found in response.")
+            raise ValueError("No JSON object found in response")
 
-        prediction_data = json.loads(json_match.group(0))
+        data = json.loads(json_match.group(0))
 
-        # Validation: Ensure probabilities sum to 1.0
-        yes_prob = prediction_data["prediction"].get("Yes", 0.5)
-        no_prob = prediction_data["prediction"].get("No", 0.5)
+        # Validate required fields
+        required = {"estimated_probability", "confidence", "reasoning", "sources_used"}
+        missing = required - set(data.keys())
+        if missing:
+            raise ValueError(f"Missing required fields: {missing}")
 
-        total = yes_prob + no_prob
-        if total != 1.0:
-            prediction_data["prediction"]["Yes"] = round(yes_prob / total, 2)
-            prediction_data["prediction"]["No"] = round(no_prob / total, 2)
+        # Clamp probability to valid range
+        prob = float(data["estimated_probability"])
+        prob = max(0.01, min(0.99, prob))
+        data["estimated_probability"] = round(prob, 4)
 
-        return prediction_data
+        # Ensure market_id is set correctly
+        data["market_id"] = market.market_id
+
+        # Validate confidence value
+        if data.get("confidence") not in ("high", "medium", "low"):
+            data["confidence"] = "low"
+
+        return data
 
     except (ValueError, KeyError, json.JSONDecodeError) as e:
-        print(f"[ERROR] JSON Parsing failed for {fallback_event_id}: {e}")
+        logger.warning(
+            "JSON parsing failed for market %s: %s | raw: %.100s",
+            market.market_id,
+            e,
+            llm_response,
+        )
+        return None
 
-        # FALLSAFE: Calculate p_market = (1 - no_ask + yes_ask) / 2
-        try:
-            yes_ask = market_stats.get("Yes", {}).get("yes_ask", 0.5)
-            no_ask = market_stats.get("No", {}).get("no_ask", 0.5)
-            p_market = round((1 - no_ask + yes_ask) / 2, 2)
-        except (AttributeError, TypeError):
-            p_market = 0.5
 
-        return {
-            "event_id": fallback_event_id,
-            "prediction": {"Yes": p_market, "No": round(1.0 - p_market, 2)},
-            "rationale": (
-                "Fallback triggered due to model parsing error. "
-                "Defaulting to market consensus."
-            ),
-        }
+def _market_anchored_fallback(market: FilteredMarket, retry_count: int) -> HypothesisResult:
+    """
+    Safe fallback: anchor to market price when all LLM calls fail.
+    Produces zero edge — no trade will be placed, but pipeline doesn't crash.
+    """
+    logger.warning(
+        "Hypothesis fallback to market-anchored probability for %s", market.market_id
+    )
+    return HypothesisResult(
+        market_id=market.market_id,
+        question=market.question,
+        market_ask=market.best_ask,
+        market_bid=market.best_bid,
+        estimated_probability=market.best_ask,   # zero edge
+        edge=0.0,
+        confidence="low",
+        reasoning=(
+            "Fallback triggered — all LLM calls failed or returned invalid output. "
+            "Defaulting to market consensus price. No trade will be placed."
+        ),
+        sources_used=[],
+        retry_count=retry_count,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
+
+async def run_hypothesis(
+    market: FilteredMarket,
+    openrouter_api_key: str,
+    tavily_api_key: str | None = None,
+    *,
+    retry_count: int = 0,
+    timeout: float = 90.0,
+) -> HypothesisResult:
+    """
+    Full hypothesis stage for a single filtered market.
+
+    Steps:
+      1. Run retrieval (web search + cache) to get news context
+      2. Build user prompt with market data + context
+      3. Call Claude Sonnet 4 via OpenRouter
+      4. Extract + validate JSON response
+      5. Compute edge vs market price
+      6. Return HypothesisResult (or market-anchored fallback)
+
+    Args:
+        market:              FilteredMarket from the extraction stage.
+        openrouter_api_key:  OpenRouter API key.
+        tavily_api_key:      Tavily search API key (optional).
+        retry_count:         How many times Verify has looped back to us.
+        timeout:             HTTP timeout for the Claude call.
+
+    Returns:
+        HypothesisResult — always returns (uses fallback on failure).
+    """
+    # --- Step 1: Retrieval ---
+    retrieval: RetrievalResult = await run_retrieval(
+        market_id=market.market_id,
+        question=market.question,
+        openrouter_api_key=openrouter_api_key,
+        tavily_api_key=tavily_api_key,
+    )
+    context_string = build_context_string(retrieval)
+
+    # --- Step 2: Build prompt ---
+    user_prompt = build_user_prompt(market, context_string)
+
+    # --- Step 3: Call Claude Sonnet 4 ---
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            response = await client.post(
+                "https://openrouter.ai/api/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {openrouter_api_key}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "anthropic/claude-sonnet-4",
+                    "temperature": 0.2,
+                    "max_tokens": 1000,
+                    "messages": [
+                        {"role": "system", "content": _SYSTEM_PROMPT},
+                        {"role": "user", "content": user_prompt},
+                    ],
+                },
+            )
+            response.raise_for_status()
+            raw_content = response.json()["choices"][0]["message"]["content"]
+
+    except httpx.TimeoutException:
+        logger.error("Hypothesis timeout for market %s", market.market_id)
+        return _market_anchored_fallback(market, retry_count)
+    except Exception as e:
+        logger.error("Hypothesis API error for market %s: %s", market.market_id, e)
+        return _market_anchored_fallback(market, retry_count)
+
+    # --- Step 4: Extract + validate ---
+    parsed = extract_and_validate(raw_content, market)
+    if parsed is None:
+        return _market_anchored_fallback(market, retry_count)
+
+    # --- Step 5: Compute edge ---
+    estimated_prob = parsed["estimated_probability"]
+    edge = round(estimated_prob - market.best_ask, 4)
+
+    result = HypothesisResult(
+        market_id=market.market_id,
+        question=market.question,
+        market_ask=market.best_ask,
+        market_bid=market.best_bid,
+        estimated_probability=estimated_prob,
+        edge=edge,
+        confidence=parsed["confidence"],
+        reasoning=parsed["reasoning"],
+        sources_used=parsed.get("sources_used", []),
+        retry_count=retry_count,
+    )
+
+    logger.info(
+        "Hypothesis [%s] prob=%.3f ask=%.3f edge=%.3f conf=%s cached=%s",
+        market.market_id[:30],
+        estimated_prob,
+        market.best_ask,
+        edge,
+        result.confidence,
+        retrieval.cached,
+    )
+
+    # Log if edge is below threshold (won't trade, but useful for tuning)
+    if abs(edge) < HYPOTHESIS_MIN_EDGE:
+        logger.debug(
+            "Market %s edge %.3f below threshold %.3f — will not trade",
+            market.market_id,
+            edge,
+            HYPOTHESIS_MIN_EDGE,
+        )
+
+    return result
