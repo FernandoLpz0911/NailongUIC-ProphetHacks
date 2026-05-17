@@ -25,8 +25,8 @@ from ai_prophet.trade.llm.base import LLMRequest
 logger = logging.getLogger(__name__)
 
 # Near-expiry strategy constants.
-NEAR_EXPIRY_SECS = 3_600   # ≤ 1 h — strongly preferred, relaxed price filter
-MAX_HORIZON_SECS = 7_200   # 2 h outer cutoff; drop everything farther out
+NEAR_EXPIRY_SECS = 3_600    # ≤ 1 h — strongly preferred, relaxed price filter
+FAR_HORIZON_SECS = 86_400   # > 24 h — deprioritised but not excluded
 
 # ---------------------------------------------------------------------------
 # Category classification — used to label candidates and enforce diversity.
@@ -200,10 +200,26 @@ class TextReviewStage(ReviewStage):
         candidates: Sequence[CandidateMarket],
         tick_ctx: TickContext,
     ) -> dict:
-        # --- Near-expiry filter & sort -----------------------------------
+        # --- Near-expiry sort & filter -----------------------------------
+        # Strategy: prefer markets expiring soonest but never leave the list
+        # empty. Three tiers drive the sort:
+        #   0 — near-expiry (≤ 1 h): highest priority, relaxed price filter
+        #   1 — medium (1 h – 24 h): standard filter
+        #   2 — far (> 24 h or unknown): lowest priority, standard filter
+        # Already-resolved markets (secs ≤ 0) are always dropped.
         ref_ts = getattr(tick_ctx, "tick_ts", None)
         if isinstance(ref_ts, datetime) and ref_ts.tzinfo is None:
             ref_ts = ref_ts.replace(tzinfo=timezone.utc)
+
+        def _tier(m: CandidateMarket) -> int:
+            secs = _secs_to_expiry(m, ref_ts)
+            if secs is None:
+                return 2
+            if secs <= NEAR_EXPIRY_SECS:
+                return 0
+            if secs <= FAR_HORIZON_SECS:
+                return 1
+            return 2
 
         active: list[CandidateMarket] = []
         for m in candidates:
@@ -212,12 +228,10 @@ class TextReviewStage(ReviewStage):
 
             if secs is not None and secs <= 0:
                 continue  # already resolved
-            if secs is not None and secs > MAX_HORIZON_SECS:
-                continue  # farther than 2 h — skip entirely
 
-            # Near-expiry markets can be near-boundary and still have edge;
-            # use a relaxed price filter. Standard filter applies otherwise.
-            if secs is not None and secs <= NEAR_EXPIRY_SECS:
+            # Near-expiry markets can sit near-boundary and still have edge;
+            # use a relaxed price filter. Standard filter for everything else.
+            if _tier(m) == 0:
                 if not (0.03 < mid < 0.97):
                     continue
             else:
@@ -225,23 +239,27 @@ class TextReviewStage(ReviewStage):
                     continue
             active.append(m)
 
-        # Soonest-expiring first; tiebreak on liquidity.
+        # Soonest-expiring first within each tier; tiebreak on liquidity.
         active.sort(key=lambda m: (
+            _tier(m),
             _secs_to_expiry(m, ref_ts) or 9_999_999,
             -float(m.volume_24h or 0),
         ))
         candidates_list = active[:80]
 
+        near_count = sum(1 for m in candidates_list if _tier(m) == 0)
         logger.info(
-            "Review: %d candidates after near-expiry filter (≤%ds), %d shown to LLM",
-            len(active), MAX_HORIZON_SECS, len(candidates_list),
+            "Review: %d candidates (%d near-expiry <=1h, %d total), %d shown to LLM",
+            len(active), near_count, len(candidates), len(candidates_list),
         )
 
         def _expiry_label(m: CandidateMarket) -> str:
             secs = _secs_to_expiry(m, ref_ts)
             if secs is None:
-                return "?min"
-            return f"{int(secs / 60)}min"
+                return "?"
+            if secs <= FAR_HORIZON_SECS:
+                return f"{int(secs / 60)}min"
+            return f"{secs / 86_400:.1f}d"
 
         candidates_text = "\n".join(
             f"{m.market_id} | {m.question[:80]} | "
@@ -264,10 +282,12 @@ class TextReviewStage(ReviewStage):
         system_prompt = f"""\
 You are a prediction market analyst selecting markets for detailed analysis.
 
-STRATEGY — NEAR-EXPIRY FOCUS:
-All markets listed expire within the next 2 hours (shown as "exp-in Xmin").
+STRATEGY — PREFER NEAR-EXPIRY:
+Markets are sorted soonest-expiring first (shown as "exp-in Xmin/Xd").
 STRONGLY PREFER markets expiring within 60 minutes — prices move fastest near
-resolution, and you collect your payoff quickly with minimal duration risk.
+resolution, payoff is quick, and duration risk is minimal.
+Select longer-horizon markets only when near-expiry options are thin or you
+have strong conviction that current pricing is wrong.
 
 HOW PREDICTION MARKETS WORK:
 - Price = probability (0.50 = 50% chance of YES)
@@ -311,7 +331,7 @@ OUTPUT RULES — read carefully:
             f"Current tick: {tick_ctx.tick_ts}\n"
             f"Cash available: ${float(tick_ctx.cash):,.0f}\n"
             f"{positions_text}\n"
-            f"{len(candidates_list)} candidate markets expiring within 2 hours "
+            f"{len(candidates_list)} candidate markets sorted soonest-first "
             f"(ID | Question | Bid/Ask | 24h Volume | exp-in Xmin [category]):\n"
             f"{candidates_text}\n\n"
             f"Select up to {self.max_markets} markets worth researching. "
