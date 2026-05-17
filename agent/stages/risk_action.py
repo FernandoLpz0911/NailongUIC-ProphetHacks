@@ -117,8 +117,16 @@ class RiskAwareActionStage(ActionStage):
             # raw_gap and llm_var come from the forecast sidecar populated by
             # CalibratedForecastStage. Falls back gracefully when running under
             # tests or the SDK base stage (no sidecar entry → no extra gating).
+            # Try both the normalized ID and the bare ID (review may omit prefix).
             from agent.stages.calibrated_forecast import TICK_FORECAST_EXTRAS
-            extras = TICK_FORECAST_EXTRAS.get(market_id, {})
+            bare_id = (
+                market_id[len("kalshi:"):]
+                if market_id.startswith("kalshi:") else market_id
+            )
+            extras = (
+                TICK_FORECAST_EXTRAS.get(market_id)
+                or TICK_FORECAST_EXTRAS.get(bare_id, {})
+            )
             raw_gap_val = extras.get("raw_gap")
             raw_gap: float | None = (
                 float(raw_gap_val) if raw_gap_val is not None else None
@@ -127,6 +135,11 @@ class RiskAwareActionStage(ActionStage):
                 llm_var = float(extras.get("llm_var", 0.0))
             except (TypeError, ValueError):
                 llm_var = 0.0
+            conf_model_val = extras.get("conf_model")
+            conf_model: float | None = (
+                float(conf_model_val)
+                if conf_model_val is not None else None
+            )
 
             decision = self._score_market(
                 market_id=market_id,
@@ -137,6 +150,8 @@ class RiskAwareActionStage(ActionStage):
                 min_edge=min_edge,
                 raw_gap=raw_gap,
                 llm_var=llm_var,
+                current_port_var=current_port_var,
+                conf_model=conf_model,
             )
             if decision is not None:
                 scored.append(decision)
@@ -149,6 +164,16 @@ class RiskAwareActionStage(ActionStage):
         decisions: dict[str, dict[str, Any]] = {}
         running_notional = 0.0
         new_positions_opened = 0
+
+        # Count open positions by category (cross-tick diversity cap).
+        open_cat_counts: dict[str, int] = {}
+        for pos in tick_ctx.positions:
+            pos_info = tick_ctx.get_candidate(pos.market_id)
+            pos_q = pos_info.question if pos_info else ""
+            cat = _category(pos.market_id, pos_q)
+            open_cat_counts[cat] = open_cat_counts.get(cat, 0) + 1
+
+        # Per-tick new-buy count by category (enforces max_intents_per_category).
         category_counts: dict[str, int] = {}
 
         # 1. Mechanical exits — take-profit and stop-loss before forecast BUYs.
@@ -198,10 +223,21 @@ class RiskAwareActionStage(ActionStage):
                     continue
 
             cat = _category(mid, d.get("question", ""))
+            # Per-tick new-buy cap.
             if category_counts.get(cat, 0) >= self.constraints.max_intents_per_category:
                 logger.info(
-                    "Action: skip %s [%s], category cap %d reached",
+                    "Action: skip %s [%s], per-tick cap %d reached",
                     mid, cat, self.constraints.max_intents_per_category,
+                )
+                continue
+            # Cross-tick total open cap: existing + new intents this tick.
+            total_in_cat = (
+                open_cat_counts.get(cat, 0) + category_counts.get(cat, 0)
+            )
+            if total_in_cat >= self.constraints.max_open_per_category:
+                logger.info(
+                    "Action: skip %s [%s], total open cap %d reached",
+                    mid, cat, self.constraints.max_open_per_category,
                 )
                 continue
 
@@ -244,7 +280,8 @@ class RiskAwareActionStage(ActionStage):
         min_edge: float,
         raw_gap: float | None = None,
         llm_var: float = 0.0,
-        current_port_var: float = 0.0,  # <-- NEW argument
+        current_port_var: float = 0.0,
+        conf_model: float | None = None,
     ) -> dict[str, Any] | None:
         """Compute (side, edge, sizing) for one market; return None to skip.
 
@@ -256,6 +293,17 @@ class RiskAwareActionStage(ActionStage):
           - Otherwise (tests / base SDK): gate on blended edge >= min_edge.
         Sizing uses the blended edge in both cases (conservative Kelly input).
         """
+        # Confidence gate: when ensemble sampling nearly or fully failed,
+        # p_model defaults to 0.5 (no information). Skip rather than trade
+        # on a meaningless uniform prior disguised as a large edge.
+        if conf_model is not None and conf_model < self.risk.min_conf_model:
+            logger.debug(
+                "Action: skip %s, conf_model=%.2f < min %.2f"
+                " (ensemble sampling failed)",
+                market_id, conf_model, self.risk.min_conf_model,
+            )
+            return None
+
         p_yes = _clamp01(p_yes)
         p_no = 1.0 - p_yes
 
@@ -278,6 +326,13 @@ class RiskAwareActionStage(ActionStage):
         # Gate: raw-gap (pre-blend) when available; blended edge otherwise.
         if raw_gap is not None:
             if abs(raw_gap) < self.risk.min_raw_gap:
+                return None
+            if abs(raw_gap) > self.risk.max_raw_gap_hard:
+                logger.debug(
+                    "Action: skip %s, |raw_gap| %.2f > max_raw_gap_hard %.2f"
+                    " (model knowledge likely stale)",
+                    market_id, abs(raw_gap), self.risk.max_raw_gap_hard,
+                )
                 return None
         else:
             if best_edge < min_edge:
@@ -329,6 +384,22 @@ class RiskAwareActionStage(ActionStage):
         if best_price <= 0 or best_price >= 1.0:
             return None  # Degenerate or resolved-near-expiry market.
 
+        # Spread gate: wide spreads eat edge at entry. Exempt from flip-as-sell.
+        yes_bid = float(market.yes_bid)
+        no_bid = float(market.no_bid)
+        if best_side == "YES":
+            spread_mid = (yes_ask + yes_bid) / 2.0
+            spread_pct = (yes_ask - yes_bid) / spread_mid if spread_mid > 0 else 1.0
+        else:
+            spread_mid = (no_ask + no_bid) / 2.0
+            spread_pct = (no_ask - no_bid) / spread_mid if spread_mid > 0 else 1.0
+        if spread_pct > self.risk.max_spread_pct:
+            logger.debug(
+                "Action: skip %s, spread %.1f%% > max %.1f%%",
+                market_id, spread_pct * 100, self.risk.max_spread_pct * 100,
+            )
+            return None
+
         # Epistemic shrinkage (James-Stein): reduce when LLM ensemble shows high
         # variance, since σ²_position = p(1-p) + Var(LLM_samples).
         from agent.calibration import epistemic_shrink
@@ -360,8 +431,7 @@ class RiskAwareActionStage(ActionStage):
         # ------------------------------------------------
 
         # B. Portfolio-Level Penalty (Heat Check)
-        target_max_var = getattr(self.risk, 'target_portfolio_var', 0.05)
-        heat_penalty = max(0.1, 1.0 - (current_port_var / target_max_var))
+        heat_penalty = max(0.1, 1.0 - (current_port_var / self.risk.target_portfolio_var))
 
         # C. Calculate Adjusted Size
         kelly_frac = (

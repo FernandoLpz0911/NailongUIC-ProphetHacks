@@ -16,15 +16,16 @@ from __future__ import annotations
 
 import logging
 import math
+import re
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from ai_prophet.trade.agent.stages.forecast import ForecastStage
-from ai_prophet.trade.agent.tool_schemas import FORECAST_TOOL
 from ai_prophet.trade.core import TickContext
 from ai_prophet.trade.llm import LLMClient, LLMMessage
+from ai_prophet.trade.llm.base import LLMRequest
 
 from agent.calibration import calibrate, market_mid
 from agent.settings import CalibrationConfig
@@ -69,7 +70,7 @@ def _confidence_from_summary(summary: dict[str, Any]) -> str:
 
     The SDK's SearchStage produces `summary["key_points"]` (list of strings)
     and `summary["open_questions"]` (list). Our retrieval module also fills
-    `summary["sources"]` when available. We map these to one of high/medium/low.
+    `summary["sources"]` when available. Maps to one of high/medium/low.
 
     Heuristic: lots of concrete key points + few open questions => high.
     """
@@ -83,27 +84,24 @@ def _confidence_from_summary(summary: dict[str, Any]) -> str:
 
 
 _SUPERFORECASTER_SYSTEM = """\
-You are an expert prediction market forecaster trained in superforecasting.
+You are an expert prediction market forecaster.
 
-Reason through FOUR steps before calling submit_forecast:
+In your internal reasoning (not visible in your response), work through:
+  A. Reference class — 3 historical analogues → compute base_rate
+  B. Scenario decomposition — 2-4 MECE scenarios with probabilities
+  C. Reconcile base_rate vs. inside view; commit to a final probability
 
-Step A — Reference Class: Name 3 historical events analogous to this \
-question. For each give the outcome (YES/NO). Compute base_rate = #YES / 3.
+OUTPUT RULES — critical:
+- Your entire response must be exactly ONE line of JSON, nothing else.
+- Do NOT write "Step A", "Step B", or any prose in your response.
+- Do NOT use markdown, code fences, or tool calls.
+- Format: {"p_yes": 0.XX}
 
-Step B — Scenario Decomposition: Identify 2-4 MECE scenarios leading to \
-YES or NO. Assign a probability to each (must sum to 1.0).
-
-Step C — Inside-Outside Reconciliation: State your base_rate (Step A) and \
-your inside-view estimate (Step B). Commit to a final probability and explain \
-what specific evidence pulls you away from the base rate.
-
-Step D — Call submit_forecast with your final probability.
-
-Principles:
-- Reason from evidence, NOT from the market price (shown for context only).
+Forecasting principles (apply in your reasoning, not in your response):
+- Reason from evidence, NOT from market price (shown for context only).
 - Disagree with the market when evidence warrants.
-- Extremes (p < 0.05 or p > 0.95) require strong, specific evidence.
-- Be calibrated: a 70% estimate should be right ~70% of the time.\
+- Extremes (p < 0.05 or p > 0.95) require strong specific evidence.
+- Be calibrated: 70% should be right roughly 70% of the time.\
 """
 
 
@@ -125,16 +123,38 @@ class CalibratedForecastStage(ForecastStage):
     # Ensemble helpers
     # ------------------------------------------------------------------
 
-    def _one_sample(self, messages: list[LLMMessage], market_id: str) -> float | None:
-        """Single LLM call; returns clamped p_yes or None on failure."""
+    def _one_sample(
+        self, messages: list[LLMMessage], market_id: str
+    ) -> float | None:
+        """Single LLM call; returns clamped p_yes or None on failure.
+
+        Uses plain text generation (no tool call) to avoid Gemini's
+        MALFORMED_FUNCTION_CALL bug where it wraps calls in print().
+        """
         try:
-            raw = self.llm_client.generate_json(messages, tool=FORECAST_TOOL)
-            p = raw.get("p_yes", 0.5)
-            if isinstance(p, (int, float)) and 1.0 < p <= 100.0:
-                p = p / 100.0
-            return float(max(0.0, min(1.0, float(p))))
-        except Exception as exc:
-            logger.warning("Ensemble sample failed for %s: %s", market_id, exc)
+            # Gemini 2.5 Flash counts thinking tokens against max_tokens.
+            # The model uses ~500 thinking tokens, then writes Steps A-C
+            # in response text, then emits the final JSON. 4096 gives
+            # ~3500 output tokens after thinking — enough for all steps.
+            response = self.llm_client.generate(
+                LLMRequest(messages=messages, max_tokens=4096)
+            )
+            text = response.content or ""
+            m = re.search(r'"p_yes"\s*:\s*([0-9.]+)', text)
+            if not m:
+                logger.warning(
+                    "No p_yes in forecast response for %s: %.100s",
+                    market_id, text,
+                )
+                return None
+            p = float(m.group(1))
+            if 1.0 < p <= 100.0:
+                p /= 100.0
+            return max(0.0, min(1.0, p))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Ensemble sample failed for %s: %s", market_id, exc
+            )
             return None
 
     def _ensemble_samples(
@@ -149,7 +169,9 @@ class CalibratedForecastStage(ForecastStage):
         Confidence: 1 - std(raw samples), clipped to [0, 1].
         """
         with ThreadPoolExecutor(max_workers=min(n, 8)) as pool:
-            results = list(pool.map(lambda _: self._one_sample(messages, market_id), range(n)))
+            results = list(pool.map(
+                lambda _: self._one_sample(messages, market_id), range(n)
+            ))
 
         valid = [p for p in results if p is not None]
         if not valid:
@@ -192,7 +214,7 @@ class CalibratedForecastStage(ForecastStage):
             )
             return {
                 "p_yes": p_market,
-                "rationale": "[KILL_SWITCH] Budget exhausted; anchored to market mid.",
+                "rationale": "[KILL_SWITCH] anchored to market mid.",
             }
 
         # 1. Kalshi mid. Try bare ID first, then with kalshi: prefix in case
@@ -202,30 +224,32 @@ class CalibratedForecastStage(ForecastStage):
             market_info = tick_ctx.get_candidate("kalshi:" + market_id)
         if market_info is None:
             logger.warning(
-                "Forecast: market %s missing from tick_ctx, falling back to super",
+                "Forecast: %s missing from tick_ctx, falling back to super",
                 market_id,
             )
             return super()._generate_forecast(market_id, summary, tick_ctx)
         p_market = market_mid(market_info.yes_bid, market_info.yes_ask)
         if p_market is None:
             logger.warning(
-                "Forecast: market %s has no usable quote, falling back to super",
+                "Forecast: %s has no usable quote, falling back to super",
                 market_id,
             )
             return super()._generate_forecast(market_id, summary, tick_ctx)
 
-        # 1b. Pre-filter: skip the ensemble for markets that will never generate
-        #     a tradeable edge. Returning p_market here costs zero LLM tokens;
-        #     the action stage computes edge≈0 and drops it automatically.
+        # 1b. Pre-filter: skip ensemble for markets that can't generate edge.
+        #     Returning p_market costs zero LLM tokens; action stage drops it.
         #
-        #     Tail-risk filter: near-boundary prices have severe asymmetric risk
-        #     and almost never move enough to justify a bet.
+        #     Tail-risk filter: near-boundary prices have severe asymmetric
+        #     risk and almost never move enough to justify a bet.
         if p_market < 0.07 or p_market > 0.93:
             logger.info(
                 "Forecast %s: skipping ensemble (p_market=%.3f near boundary)",
                 market_id, p_market,
             )
-            return {"p_yes": p_market, "rationale": "[pre-filter: boundary price]"}
+            return {
+                "p_yes": p_market,
+                "rationale": "[pre-filter: boundary price]",
+            }
 
         #     Low-liquidity filter: spreads too wide for reliable fills.
         spread = float(market_info.yes_ask) - float(market_info.yes_bid)
@@ -234,7 +258,10 @@ class CalibratedForecastStage(ForecastStage):
                 "Forecast %s: skipping ensemble (spread=%.3f too wide)",
                 market_id, spread,
             )
-            return {"p_yes": p_market, "rationale": "[pre-filter: wide spread]"}
+            return {
+                "p_yes": p_market,
+                "rationale": "[pre-filter: wide spread]",
+            }
 
         # 2. Build structured superforecaster prompt.
         summary_text = summary.get("summary", "No summary available")
@@ -270,7 +297,9 @@ class CalibratedForecastStage(ForecastStage):
 
         # 3. Ensemble: n calls, trimmed-mean on logit scale.
         n = self.calibration.llm_ensemble_n
-        p_model, conf_model, llm_var = self._ensemble_samples(messages, market_id, n)
+        p_model, conf_model, llm_var = self._ensemble_samples(
+            messages, market_id, n
+        )
 
         # Single-call fallback rationale (we don't capture per-sample rationale
         # in the ensemble path to keep logging tractable).
@@ -279,13 +308,13 @@ class CalibratedForecastStage(ForecastStage):
         # 4. Polymarket second-market signal (cached per process).
         poly = _cached_polymarket(market_info.question)
 
-        # 5. Confidence label from search summary (used only when conf_model=0).
+        # 5. Confidence label from summary (used only when conf_model=0).
         confidence = _confidence_from_summary(summary)
 
         # 6. Low-liquidity flag for dynamic alpha.
         low_liquidity = (market_info.volume_24h or 0.0) < 2000.0
 
-        # 7. Blend, cap deviation, return SDK schema + extra fields for action stage.
+        # 7. Blend, cap deviation, return SDK schema + extras for action stage.
         result = calibrate(
             p_model=p_model,
             p_market=p_market,
@@ -312,7 +341,7 @@ class CalibratedForecastStage(ForecastStage):
         )
 
         # Stash extras for the action stage via the sidecar dict.
-        # Cannot include these in the returned dict — the SDK schema validator
+        # Cannot include these in the returned dict — SDK schema validator
         # enforces additionalProperties:false on forecast results.
         TICK_FORECAST_EXTRAS[market_id] = {
             "raw_gap":    result.raw_gap,

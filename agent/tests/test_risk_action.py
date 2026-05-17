@@ -22,6 +22,14 @@ from agent.stages.risk_action import RiskAwareActionStage
 # Fixtures
 # ---------------------------------------------------------------------------
 
+@pytest.fixture(autouse=True)
+def _clear_forecast_extras():
+    """Reset TICK_FORECAST_EXTRAS between tests so raw_gap tests don't leak."""
+    from agent.stages.calibrated_forecast import TICK_FORECAST_EXTRAS
+    TICK_FORECAST_EXTRAS.clear()
+    yield
+    TICK_FORECAST_EXTRAS.clear()
+
 def _tick_boundary(minutes: int = 15) -> datetime:
     """Snap to a 15-min boundary (the SDK enforces this in TickContext.__post_init__)."""
     now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
@@ -112,6 +120,108 @@ def make_stage(**risk_overrides) -> RiskAwareActionStage:
 
 
 # ---------------------------------------------------------------------------
+# Bid-ask spread filter
+# ---------------------------------------------------------------------------
+
+def test_wide_spread_buy_skipped():
+    # bid=0.30, ask=0.50 -> spread 0.20, mid 0.40, pct 50% > 15% cap.
+    m = make_market("M1", yes_bid=0.30, yes_ask=0.50)
+    tick = make_tick(candidates=[m])
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result({"M1": {"p_yes": 0.70, "rationale": ""}}))
+    assert out.data["intents"] == []
+
+
+def test_tight_spread_buy_passes():
+    # bid=0.36, ask=0.40 -> spread 0.04, mid 0.38, pct ~10.5% < 15% cap.
+    m = make_market("M1", yes_bid=0.36, yes_ask=0.40)
+    tick = make_tick(candidates=[m])
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result({"M1": {"p_yes": 0.65, "rationale": ""}}))
+    assert len(out.data["intents"]) == 1
+    assert out.data["intents"][0]["action"] == "BUY"
+
+
+def test_spread_filter_configurable():
+    # pct ~10.5%; default 15% passes, tight 8% cap rejects.
+    m = make_market("M1", yes_bid=0.36, yes_ask=0.40)
+    tick = make_tick(candidates=[m])
+    stage_tight = RiskAwareActionStage(
+        llm_client=None,
+        constraints=TradingConstraints(),
+        risk=RiskConfig(max_spread_pct=0.08),
+    )
+    out = stage_tight.execute(tick, forecast_result({"M1": {"p_yes": 0.65, "rationale": ""}}))
+    assert out.data["intents"] == []
+
+
+def test_spread_filter_does_not_block_flip_as_sell():
+    # Wide spread: bid=0.30, ask=0.70 -> pct 80%. Flip-as-sell must still fire.
+    m = make_market("M1", yes_bid=0.30, yes_ask=0.70)
+    from dataclasses import replace as dc_replace
+    held = dc_replace(
+        make_position("M1", "YES", shares=50.0, avg_entry=0.60),
+        current_price=Decimal("0.30"),
+    )
+    tick = make_tick(candidates=[m], positions=[held])
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result({"M1": {"p_yes": 0.10, "rationale": "flipped"}}))
+    assert len(out.data["intents"]) == 1
+    assert out.data["intents"][0]["action"] == "SELL"
+
+
+# ---------------------------------------------------------------------------
+# Max raw-gap hard block (stale-model guard)
+# ---------------------------------------------------------------------------
+
+def _with_raw_gap(market_id: str, p_yes: float, raw_gap: float) -> dict[str, dict]:
+    """Populate TICK_FORECAST_EXTRAS so _score_market sees the raw_gap."""
+    from agent.stages.calibrated_forecast import TICK_FORECAST_EXTRAS
+    TICK_FORECAST_EXTRAS[market_id] = {"raw_gap": raw_gap, "llm_var": 0.0}
+    return {market_id: {"p_yes": p_yes, "rationale": ""}}
+
+
+def test_max_raw_gap_hard_blocks_trade():
+    # raw_gap=0.45 > default 0.30 hard cap -> no trade.
+    m = make_market("M1", yes_bid=0.09, yes_ask=0.10)
+    tick = make_tick(candidates=[m])
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result(_with_raw_gap("M1", p_yes=0.55, raw_gap=0.45)))
+    assert out.data["intents"] == []
+
+
+def test_max_raw_gap_hard_blocks_negative_gap():
+    # raw_gap=-0.60 (model much lower than market) also blocked.
+    m = make_market("M1", yes_bid=0.36, yes_ask=0.40)
+    tick = make_tick(candidates=[m])
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result(_with_raw_gap("M1", p_yes=0.10, raw_gap=-0.60)))
+    assert out.data["intents"] == []
+
+
+def test_max_raw_gap_hard_allows_moderate_gap():
+    # raw_gap=0.20 < 0.30 -> trade proceeds.
+    m = make_market("M1", yes_bid=0.09, yes_ask=0.10)
+    tick = make_tick(candidates=[m])
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result(_with_raw_gap("M1", p_yes=0.55, raw_gap=0.20)))
+    assert len(out.data["intents"]) == 1
+
+
+def test_max_raw_gap_hard_configurable():
+    # Tighter cap of 0.15 blocks a raw_gap of 0.20.
+    m = make_market("M1", yes_bid=0.09, yes_ask=0.10)
+    tick = make_tick(candidates=[m])
+    stage = RiskAwareActionStage(
+        llm_client=None,
+        constraints=TradingConstraints(),
+        risk=RiskConfig(max_raw_gap_hard=0.15),
+    )
+    out = stage.execute(tick, forecast_result(_with_raw_gap("M1", p_yes=0.55, raw_gap=0.20)))
+    assert out.data["intents"] == []
+
+
+# ---------------------------------------------------------------------------
 # Edge gate
 # ---------------------------------------------------------------------------
 
@@ -164,34 +274,32 @@ def test_buy_no_when_negative_yes_edge_but_positive_no_edge():
 # ---------------------------------------------------------------------------
 
 def test_size_capped_by_max_position_pct_of_equity():
-    # Massive edge would otherwise size higher; we cap at 5% of $10k = $500.
-    m = make_market("M1", yes_bid=0.05, yes_ask=0.10)
+    # Massive edge; cap at 5% of $10k = $500 (explicit pct so test is .env-independent).
+    # bid=0.09/ask=0.10 -> spread_pct ~10.5%, passes the spread gate.
+    m = make_market("M1", yes_bid=0.09, yes_ask=0.10)
     tick = make_tick(candidates=[m], equity=10_000.0)
-    forecasts = {"M1": {"p_yes": 0.95, "rationale": "huge edge"}}
 
-    stage = make_stage()
-    out = stage.execute(tick, forecast_result(forecasts))
-    decisions = out.data["decisions"]
-    assert decisions["M1"]["size_usd"] <= 500.0 + 1e-6
+    stage = make_stage(max_position_pct_of_equity=0.05)
+    out = stage.execute(tick, forecast_result({"M1": {"p_yes": 0.95, "rationale": "huge edge"}}))
+    assert out.data["decisions"]["M1"]["size_usd"] <= 500.0 + 1e-6
 
 
 def test_size_capped_by_max_notional_per_market_with_large_equity():
-    # With huge equity, the 5% cap = $50k, so the $1k per-market cap binds.
-    m = make_market("M1", yes_bid=0.05, yes_ask=0.10)
+    # With huge equity, 5% cap = $50k, so $1k per-market cap binds.
+    m = make_market("M1", yes_bid=0.09, yes_ask=0.10)
     tick = make_tick(candidates=[m], equity=1_000_000.0)
-    forecasts = {"M1": {"p_yes": 0.95, "rationale": "huge edge"}}
 
     stage = make_stage()
-    out = stage.execute(tick, forecast_result(forecasts))
-    decisions = out.data["decisions"]
-    assert decisions["M1"]["size_usd"] <= 1000.0 + 1e-6
+    out = stage.execute(tick, forecast_result({"M1": {"p_yes": 0.95, "rationale": "huge edge"}}))
+    assert out.data["decisions"]["M1"]["size_usd"] <= 1000.0 + 1e-6
 
 
 def test_gross_exposure_cap_skips_later_intents():
-    # 11 markets each priced cheap with full $1k size would total $11k.
-    # MAX_GROSS_EXPOSURE = $10k -> last one should be trimmed or skipped.
+    # 12 markets each priced cheap with full $1k size would total $12k.
+    # MAX_GROSS_EXPOSURE = $10k -> last ones should be trimmed or skipped.
+    # bid=0.09/ask=0.10 keeps spread_pct ~10.5% so spread gate doesn't fire.
     markets = [
-        make_market(f"M{i}", yes_bid=0.05, yes_ask=0.10) for i in range(12)
+        make_market(f"M{i}", yes_bid=0.09, yes_ask=0.10) for i in range(12)
     ]
     tick = make_tick(candidates=markets, equity=1_000_000.0)
     forecasts = {f"M{i}": {"p_yes": 0.95, "rationale": "edge"} for i in range(12)}
@@ -234,7 +342,7 @@ def test_max_trades_per_tick_truncates():
     tick = make_tick(candidates=markets, equity=5_000.0)
     forecasts = {f"M{i}": {"p_yes": 0.60, "rationale": ""} for i in range(25)}
 
-    constraints = TradingConstraints(max_intents_per_category=25)
+    constraints = TradingConstraints(max_intents_per_category=25, max_open_per_category=25)
     stage = _make_stage_with_constraints(constraints)
     out = stage.execute(tick, forecast_result(forecasts))
     assert len(out.data["intents"]) == 20  # MAX_TRADES_PER_TICK
@@ -354,13 +462,18 @@ def test_take_profit_fires_when_gain_exceeds_threshold():
 
 def test_take_profit_does_not_fire_below_threshold():
     m = make_market("M1", yes_bid=0.60, yes_ask=0.63)
-    # Bought YES at 0.50, now marks 0.60 -> +20% gain, under the 25% threshold.
+    # Bought YES at 0.50, now marks 0.60 -> +20% gain, under 25% threshold.
+    # Explicit threshold so this test is immune to .env overrides.
     held = make_position("M1", "YES", shares=50.0, avg_entry=0.50)
     from dataclasses import replace as dc_replace
     held = dc_replace(held, current_price=Decimal("0.60"))
     tick = make_tick(candidates=[m], positions=[held])
 
-    stage = make_stage()
+    stage = RiskAwareActionStage(
+        llm_client=None,
+        constraints=TradingConstraints(),
+        risk=RiskConfig(take_profit_threshold=0.25),
+    )
     out = stage.execute(tick, forecast_result({}))
 
     assert out.data["intents"] == []
@@ -627,7 +740,7 @@ def test_category_cap_configurable_to_one():
 def test_category_cap_respects_sort_by_edge():
     # 3 Sports markets with different edges -> cap keeps the 2 with highest edge.
     markets = [
-        make_market("S_HIGH", yes_bid=0.20, yes_ask=0.25, question="Will the NBA champ repeat?"),
+        make_market("S_HIGH", yes_bid=0.22, yes_ask=0.25, question="Will the NBA champ repeat?"),
         make_market("S_MED",  yes_bid=0.36, yes_ask=0.40, question="Will the NBA finals go 7 games?"),
         make_market("S_LOW",  yes_bid=0.45, yes_ask=0.50, question="Will the NBA player score 40?"),
     ]

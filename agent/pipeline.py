@@ -27,6 +27,7 @@ from ai_prophet_core.client import ServerAPIClient
 
 from agent.settings import RuntimeConfig, load as load_runtime
 from agent.stages.calibrated_forecast import CalibratedForecastStage
+from agent.stages.resilient_search import ResilientSearchStage
 from agent.stages.retrieval_search import RetrievalSearchClient
 from agent.stages.risk_action import RiskAwareActionStage
 from agent.stages.text_review import TextReviewStage
@@ -114,6 +115,12 @@ def build_custom_pipeline(
     pipeline.stages[0] = TextReviewStage(
         llm_client=llm_client,
         max_markets=pipeline_config["max_markets"],
+    )
+    pipeline.stages[1] = ResilientSearchStage(
+        llm_client=llm_client,
+        search_client=search_client,
+        max_queries_per_market=pipeline_config["max_queries_per_market"],
+        max_results_per_query=pipeline_config["max_results_per_query"],
     )
     pipeline.stages[2] = CalibratedForecastStage(
         llm_client=llm_client,

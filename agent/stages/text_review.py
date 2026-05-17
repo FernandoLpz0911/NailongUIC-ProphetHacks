@@ -78,7 +78,7 @@ def _clean(text: str) -> str:
 
 
 def _extract_objects(s: str) -> list[dict]:
-    """Pull every complete top-level JSON object out of a possibly-truncated string."""
+    """Pull every complete top-level JSON object out of a truncated string."""
     objects: list[dict] = []
     i = 0
     while i < len(s):
@@ -153,8 +153,8 @@ def _parse_review_json(text: str) -> dict | None:
             return objects[0]
         return {"review": objects}
 
-    # 4. Scan inside the "review": [ array directly. This handles the case where
-    # the outer object is never closed because the model was cut off mid-entry.
+    # 4. Scan inside the "review": [ array directly — handles the case where
+    # the outer object is never closed (model cut off mid-entry).
     arr_match = re.search(r'"review"\s*:\s*\[', cleaned)
     if arr_match:
         entries = _extract_objects(cleaned[arr_match.end() - 1:])
@@ -165,12 +165,10 @@ def _parse_review_json(text: str) -> dict | None:
 
 
 class TextReviewStage(ReviewStage):
-    """ReviewStage variant that uses plain-text JSON output instead of tool calling.
+    """ReviewStage variant that uses plain-text JSON output.
 
-    Identical selection logic and prompt as the SDK's ReviewStage, but the
-    system prompt instructs the model to emit a raw JSON object in its reply
-    rather than invoking the submit_review tool. This sidesteps Gemini's
-    MALFORMED_FUNCTION_CALL behaviour entirely.
+    Sidesteps Gemini's MALFORMED_FUNCTION_CALL by asking for a JSON
+    object in the reply body rather than a tool call.
     """
 
     @property
@@ -182,6 +180,29 @@ class TextReviewStage(ReviewStage):
         candidates: Sequence[CandidateMarket],
         tick_ctx: TickContext,
     ) -> dict:
+        # Pre-filter: drop near-resolved markets; cap to top 80 by volume.
+        # Sending all 250+ candidates exhausts Gemini's thinking budget.
+        active = [
+            m for m in candidates
+            if 0.08 < (float(m.yes_bid) + float(m.yes_ask)) / 2.0 < 0.92
+        ]
+        # Deprioritize long-horizon markets (year >= 2027 in ID or question).
+        # These won't resolve in the 14-day competition window; sort them last
+        # so the LLM sees near-term markets first in its capped list of 80.
+        def _is_long_horizon(m: object) -> bool:
+            text = (getattr(m, "market_id", "") + " "
+                    + getattr(m, "question", "")).lower()
+            return any(f"-{y}" in text or f" {y}" in text
+                       for y in ("2027", "2028", "2029", "2030"))
+
+        active.sort(
+            key=lambda m: (
+                _is_long_horizon(m),          # long-horizon goes last
+                -float(m.volume_24h or 0),    # then highest volume first
+            )
+        )
+        candidates = active[:80] if len(active) > 80 else active
+
         candidates_text = "\n".join(
             f"{m.market_id} | {m.question[:80]} | "
             f"{m.yes_bid:.2f}/{m.yes_ask:.2f} | ${m.volume_24h:.0f} "
@@ -189,7 +210,9 @@ class TextReviewStage(ReviewStage):
             for m in candidates
         )
 
-        positions_text = format_portfolio_summary(tick_ctx, include_positions=True)
+        positions_text = format_portfolio_summary(
+            tick_ctx, include_positions=True
+        )
         memory_summary = getattr(tick_ctx, "memory_summary", "") or ""
         memory_block = (
             f"\n\nRECENT MEMORY:\n{memory_summary}" if memory_summary else ""
@@ -212,14 +235,26 @@ HOW PREDICTION MARKETS WORK:
 Review ALL {len(candidates)} markets and select up to {self.max_markets} \
 for deeper research.
 
+THIS IS A 14-DAY COMPETITION. The only reliable P&L path is resolution gains
+— markets that actually RESOLVE in our favor during the competition window.
+A position in "2028 elections" or "2029 policy" will never resolve; it just
+drifts on sentiment and bleeds spread costs every tick.
+
+STRONGLY PREFER markets that:
+- Resolve within the next 2-4 weeks (look for near-term dates in the question)
+- Are about ongoing events with imminent conclusions: active playoffs, votes
+  happening this week, scheduled announcements, earnings in the next few days
+- Have high 24h volume (>$5,000) — volume signals near-term resolution activity
+
 GOOD REASONS TO SELECT:
-- You have domain knowledge about the topic
-- Recent news/events may not be fully priced in
-- The probability seems off based on base rates or logic
-- High volume indicates active trading interest
+- The event resolves soon and recent news may not be priced in yet
+- An ongoing sports series, trial, vote, or announcement is days away
+- The probability seems clearly off vs. publicly available information
 
 SKIP markets where:
 - Price is below 0.10 or above 0.90 (near resolution, limited upside)
+- The question contains a year ≥ 2027 (too far out to resolve in competition)
+- The event is more than 6 weeks away (won't resolve; pure sentiment drift)
 - You have no way to research or form a view
 - Question is too vague or ambiguous
 
@@ -236,7 +271,7 @@ OUTPUT RULES — read carefully:
     {{
       "market_id": "<exact ID from the list>",
       "priority": <integer, 1 = highest priority>,
-      "queries": ["<web search query>", "<web search query>", "<web search query>"],
+      "queries": ["<web search query 1>", "<query 2>", "<query 3>"],
       "rationale": "<one concise sentence>"
     }}
   ]
@@ -258,8 +293,11 @@ OUTPUT RULES — read carefully:
             LLMMessage(role="user", content=user_prompt),
         ]
 
+        # Gemini 2.5 Flash counts thinking tokens against max_tokens.
+        # With ~8k thinking tokens, 8192 only leaves ~300 for output
+        # (≈2 markets). 32768 gives 24k tokens of headroom for output.
         response = self.llm_client.generate(
-            LLMRequest(messages=messages, max_tokens=8192)
+            LLMRequest(messages=messages, max_tokens=32768)
         )
         text = response.content or ""
 
@@ -288,9 +326,11 @@ OUTPUT RULES — read carefully:
             valid.append({
                 "market_id":  str(mid),
                 "priority":   int(item.get("priority", len(valid) + 1)),
-                "queries":    [str(q) for q in queries if q],
+                "queries":    [str(q) for q in queries if q][:3],
                 "rationale":  str(item.get("rationale", "")),
             })
 
-        logger.info("TextReview: recovered %d markets from full JSON output", len(valid))
+        logger.info(
+            "TextReview: recovered %d markets from JSON output", len(valid)
+        )
         return {"review": valid}

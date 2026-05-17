@@ -90,6 +90,9 @@ class TradingConstraints:
     max_intents_per_category: int = field(
         default_factory=lambda: _env_int("MAX_INTENTS_PER_CATEGORY", 2)
     )
+    max_open_per_category: int = field(
+        default_factory=lambda: _env_int("MAX_OPEN_PER_CATEGORY", 3)
+    )
     fee_rate: float = field(default_factory=lambda: _csv_float("FEE_RATE", 0.0))
     tick_interval_seconds: int = field(
         default_factory=lambda: int(_csv_float("TICK_INTERVAL_SECONDS", 900))
@@ -120,11 +123,21 @@ class CalibrationConfig:
 class RiskConfig:
     """Knobs for the risk-aware action stage."""
 
+    min_conf_model: float = field(default_factory=lambda: _env_float("MIN_CONF_MODEL", 0.20))
     min_edge: float = field(default_factory=lambda: _env_float("MIN_EDGE", 0.05))
     min_edge_relaxed: float = field(default_factory=lambda: _env_float("MIN_EDGE_RELAXED", 0.03))
-    # Raw gap gate: minimum |p_model - p_market| before blending required to open a position.
-    # Used when the ensemble provides a raw_gap; otherwise min_edge on blended edge applies.
+    # Raw gap gates: min = need at least this gap to justify a trade.
+    # max_hard = block if gap this large (model likely has stale knowledge).
     min_raw_gap: float = field(default_factory=lambda: _env_float("MIN_RAW_GAP", 0.04))
+    max_raw_gap_hard: float = field(
+        default_factory=lambda: _env_float("MAX_RAW_GAP_HARD", 0.30)
+    )
+    max_spread_pct: float = field(
+        default_factory=lambda: _env_float("MAX_SPREAD_PCT", 0.15)
+    )
+    target_portfolio_var: float = field(
+        default_factory=lambda: _env_float("TARGET_PORTFOLIO_VAR", 0.05)
+    )
     # Quarter-Kelly (0.25) is optimal under CRRA utility with rho≈4 and a Sharpe penalty.
     kelly_fraction: float = field(default_factory=lambda: _env_float("KELLY_FRACTION", 0.25))
     max_position_pct_of_equity: float = field(
