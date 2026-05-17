@@ -46,7 +46,7 @@ def _setup_logging(verbose: bool, log_level: str) -> None:
 @click.command()
 @click.option(
     "-m", "--models", multiple=True,
-    default=("gemini:gemini-2.5-flash",),
+    default=("openrouter:anthropic/claude-sonnet-4-5",),
     show_default=True,
     help="Model specs (provider:model). Repeatable.",
 )
