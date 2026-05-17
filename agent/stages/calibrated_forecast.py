@@ -19,6 +19,7 @@ import math
 import statistics
 import time
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
 from typing import Any
 
 from ai_prophet.trade.agent.stages.forecast import ForecastStage
@@ -62,6 +63,18 @@ def _cached_polymarket(question: str) -> dict | None:
     value = fetch_polymarket(question)
     _POLY_CACHE[question] = (now, value)
     return value
+
+
+def _secs_to_expiry(market_info: object, tick_ctx: object) -> float | None:
+    res = getattr(market_info, "resolution_time", None)
+    ref_ts = getattr(tick_ctx, "tick_ts", None)
+    if not isinstance(res, datetime) or ref_ts is None:
+        return None
+    if res.tzinfo is None:
+        res = res.replace(tzinfo=timezone.utc)
+    if ref_ts.tzinfo is None:
+        ref_ts = ref_ts.replace(tzinfo=timezone.utc)
+    return (res - ref_ts).total_seconds()
 
 
 def _confidence_from_summary(summary: dict[str, Any]) -> str:
@@ -218,21 +231,29 @@ class CalibratedForecastStage(ForecastStage):
         #     a tradeable edge. Returning p_market here costs zero LLM tokens;
         #     the action stage computes edge≈0 and drops it automatically.
         #
-        #     Tail-risk filter: near-boundary prices have severe asymmetric risk
-        #     and almost never move enough to justify a bet.
-        if p_market < 0.07 or p_market > 0.93:
+        #     Near-expiry markets (≤ 1 h) get a relaxed boundary because prices
+        #     are legitimately near 0.90+ when resolution is imminent, yet the
+        #     remaining edge is still real and collectible quickly.
+        secs_left = _secs_to_expiry(market_info, tick_ctx)
+        near_expiry = secs_left is not None and secs_left <= 3_600
+
+        boundary_lo = 0.04 if near_expiry else 0.07
+        boundary_hi = 1.0 - boundary_lo
+        if p_market < boundary_lo or p_market > boundary_hi:
             logger.info(
-                "Forecast %s: skipping ensemble (p_market=%.3f near boundary)",
-                market_id, p_market,
+                "Forecast %s: skipping ensemble (p_market=%.3f near boundary, near_expiry=%s)",
+                market_id, p_market, near_expiry,
             )
             return {"p_yes": p_market, "rationale": "[pre-filter: boundary price]"}
 
         #     Low-liquidity filter: spreads too wide for reliable fills.
+        #     Near-expiry markets tolerate a wider spread — you hold briefly.
         spread = float(market_info.yes_ask) - float(market_info.yes_bid)
-        if spread > 0.12:
+        spread_limit = 0.18 if near_expiry else 0.12
+        if spread > spread_limit:
             logger.info(
-                "Forecast %s: skipping ensemble (spread=%.3f too wide)",
-                market_id, spread,
+                "Forecast %s: skipping ensemble (spread=%.3f too wide, near_expiry=%s)",
+                market_id, spread, near_expiry,
             )
             return {"p_yes": p_market, "rationale": "[pre-filter: wide spread]"}
 

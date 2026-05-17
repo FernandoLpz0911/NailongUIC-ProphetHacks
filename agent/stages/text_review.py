@@ -13,6 +13,7 @@ import json
 import logging
 import re
 from collections.abc import Sequence
+from datetime import datetime, timezone
 
 from ai_prophet.trade.agent.stages.review import ReviewStage
 from ai_prophet.trade.agent.utils import format_portfolio_summary
@@ -22,6 +23,10 @@ from ai_prophet.trade.llm import LLMMessage
 from ai_prophet.trade.llm.base import LLMRequest
 
 logger = logging.getLogger(__name__)
+
+# Near-expiry strategy constants.
+NEAR_EXPIRY_SECS = 3_600   # ≤ 1 h — strongly preferred, relaxed price filter
+MAX_HORIZON_SECS = 7_200   # 2 h outer cutoff; drop everything farther out
 
 # ---------------------------------------------------------------------------
 # Category classification — used to label candidates and enforce diversity.
@@ -63,6 +68,19 @@ def _category(market_id: str, question: str) -> str:
         if any(kw in combined for kw in keywords):
             return cat
     return "Other"
+
+
+def _secs_to_expiry(market: CandidateMarket, ref_ts: datetime | None) -> float | None:
+    if ref_ts is None:
+        return None
+    res = getattr(market, "resolution_time", None)
+    if not isinstance(res, datetime):
+        return None
+    if res.tzinfo is None:
+        res = res.replace(tzinfo=timezone.utc)
+    if ref_ts.tzinfo is None:
+        ref_ts = ref_ts.replace(tzinfo=timezone.utc)
+    return (res - ref_ts).total_seconds()
 
 
 _FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```")
@@ -182,11 +200,54 @@ class TextReviewStage(ReviewStage):
         candidates: Sequence[CandidateMarket],
         tick_ctx: TickContext,
     ) -> dict:
+        # --- Near-expiry filter & sort -----------------------------------
+        ref_ts = getattr(tick_ctx, "tick_ts", None)
+        if isinstance(ref_ts, datetime) and ref_ts.tzinfo is None:
+            ref_ts = ref_ts.replace(tzinfo=timezone.utc)
+
+        active: list[CandidateMarket] = []
+        for m in candidates:
+            secs = _secs_to_expiry(m, ref_ts)
+            mid = (float(m.yes_bid) + float(m.yes_ask)) / 2.0
+
+            if secs is not None and secs <= 0:
+                continue  # already resolved
+            if secs is not None and secs > MAX_HORIZON_SECS:
+                continue  # farther than 2 h — skip entirely
+
+            # Near-expiry markets can be near-boundary and still have edge;
+            # use a relaxed price filter. Standard filter applies otherwise.
+            if secs is not None and secs <= NEAR_EXPIRY_SECS:
+                if not (0.03 < mid < 0.97):
+                    continue
+            else:
+                if not (0.08 < mid < 0.92):
+                    continue
+            active.append(m)
+
+        # Soonest-expiring first; tiebreak on liquidity.
+        active.sort(key=lambda m: (
+            _secs_to_expiry(m, ref_ts) or 9_999_999,
+            -float(m.volume_24h or 0),
+        ))
+        candidates_list = active[:80]
+
+        logger.info(
+            "Review: %d candidates after near-expiry filter (≤%ds), %d shown to LLM",
+            len(active), MAX_HORIZON_SECS, len(candidates_list),
+        )
+
+        def _expiry_label(m: CandidateMarket) -> str:
+            secs = _secs_to_expiry(m, ref_ts)
+            if secs is None:
+                return "?min"
+            return f"{int(secs / 60)}min"
+
         candidates_text = "\n".join(
             f"{m.market_id} | {m.question[:80]} | "
             f"{m.yes_bid:.2f}/{m.yes_ask:.2f} | ${m.volume_24h:.0f} "
-            f"[{_category(m.market_id, m.question)}]"
-            for m in candidates
+            f"| exp-in {_expiry_label(m)} [{_category(m.market_id, m.question)}]"
+            for m in candidates_list
         )
 
         positions_text = format_portfolio_summary(tick_ctx, include_positions=True)
@@ -203,28 +264,32 @@ class TextReviewStage(ReviewStage):
         system_prompt = f"""\
 You are a prediction market analyst selecting markets for detailed analysis.
 
+STRATEGY — NEAR-EXPIRY FOCUS:
+All markets listed expire within the next 2 hours (shown as "exp-in Xmin").
+STRONGLY PREFER markets expiring within 60 minutes — prices move fastest near
+resolution, and you collect your payoff quickly with minimal duration risk.
+
 HOW PREDICTION MARKETS WORK:
 - Price = probability (0.50 = 50% chance of YES)
-- BUY YES at 0.40: profit if event happens (you think >40% likely)
-- BUY NO at 0.40: profit if event does NOT happen (you think <40% likely)
-- Spread between bid/ask indicates liquidity
+- BUY YES at 0.65: profit if event resolves YES (you think >65% likely)
+- BUY NO at 0.35: profit if event resolves NO (you think <35% likely)
+- Near expiry the market is often MISPRICED if you have fresher information
 
-Review ALL {len(candidates)} markets and select up to {self.max_markets} \
+Review ALL {len(candidates_list)} markets and select up to {self.max_markets} \
 for deeper research.
 
 GOOD REASONS TO SELECT:
-- You have domain knowledge about the topic
-- Recent news/events may not be fully priced in
-- The probability seems off based on base rates or logic
-- High volume indicates active trading interest
+- Expiring very soon (< 60 min) — fastest payoff, clearest signal
+- You can verify the likely outcome with a quick search RIGHT NOW
+- Recent news/events are not yet priced in (market is stale)
+- High volume indicates the market is liquid and fills are reliable
 
 SKIP markets where:
-- Price is below 0.10 or above 0.90 (near resolution, limited upside)
-- You have no way to research or form a view
-- Question is too vague or ambiguous
+- You have absolutely no way to verify the current state of affairs
+- Question is too vague or ambiguous to research quickly
+- Price is below 0.05 or above 0.95 (very little upside left)
 
 DIVERSITY RULE: Select at most 2 markets from any single category. \
-Aim for markets from at least 3 different categories. \
 Each market's category is shown in [brackets] after its line.
 
 OUTPUT RULES — read carefully:
@@ -246,10 +311,11 @@ OUTPUT RULES — read carefully:
             f"Current tick: {tick_ctx.tick_ts}\n"
             f"Cash available: ${float(tick_ctx.cash):,.0f}\n"
             f"{positions_text}\n"
-            f"All {len(candidates)} candidate markets "
-            f"(ID | Question | Bid/Ask | 24h Volume):\n"
+            f"{len(candidates_list)} candidate markets expiring within 2 hours "
+            f"(ID | Question | Bid/Ask | 24h Volume | exp-in Xmin [category]):\n"
             f"{candidates_text}\n\n"
-            f"Select up to {self.max_markets} markets worth researching."
+            f"Select up to {self.max_markets} markets worth researching. "
+            f"Prioritise those expiring soonest where you can verify the outcome now."
             f"{memory_block}"
         )
 
