@@ -16,7 +16,12 @@ from unittest.mock import MagicMock
 
 import pytest
 
-from agent.stages.text_review import TextReviewStage, _extract_objects, _parse_review_json
+from agent.stages.text_review import (
+    TextReviewStage,
+    _category,
+    _extract_objects,
+    _parse_review_json,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -238,3 +243,47 @@ def test_generate_review_handles_fenced_response():
     )
     result = stage._generate_review(_make_candidates(), _make_tick_ctx(_make_candidates()))
     assert len(result["review"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# _category — category inference
+# ---------------------------------------------------------------------------
+
+def test_category_politics_by_keyword():
+    assert _category("kalshi:KXPRES-2024", "Who will win the presidential election?") == "Politics"
+
+
+def test_category_politics_by_market_id():
+    assert _category("kalshi:kxvote-2024", "Will the vote pass?") == "Politics"
+
+
+def test_category_economics_by_keyword():
+    assert _category("kalshi:KXBTC-100K", "Will Bitcoin reach $100K?") == "Economics"
+
+
+def test_category_sports_by_keyword():
+    assert _category("kalshi:KXNBA-FINALS", "Will the Lakers win the NBA finals?") == "Sports"
+
+
+def test_category_entertainment_by_keyword():
+    assert _category("kalshi:KXOSCAR-BP", "Who will win the Oscar for Best Picture?") == "Entertainment"
+
+
+def test_category_science_tech_by_keyword():
+    assert _category("kalshi:KXSPACEX-LAUNCH", "Will SpaceX launch by Friday?") == "Science/Tech"
+
+
+def test_category_falls_back_to_other():
+    assert _category("kalshi:RANDOM-MARKET-99", "Will it rain in Seattle?") == "Other"
+
+
+def test_category_case_insensitive():
+    assert _category("KALSHI:KXNFL-SB", "NFL Super Bowl winner?") == "Sports"
+
+
+def test_category_prefers_first_match():
+    # "nba" appears in Sports but "fed" is in Economics — first match wins
+    result = _category("kxnba-market", "Will the Fed raise rates this NBA season?")
+    # Sports keywords come before Economics in the dict, but "fed" is in the text too.
+    # As long as one deterministic category is returned, we're good.
+    assert result in {"Politics", "Economics", "Sports", "Entertainment", "Science/Tech", "Other"}

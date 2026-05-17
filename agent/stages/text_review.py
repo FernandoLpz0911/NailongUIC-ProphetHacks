@@ -23,6 +23,48 @@ from ai_prophet.trade.llm.base import LLMRequest
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Category classification — used to label candidates and enforce diversity.
+# ---------------------------------------------------------------------------
+
+_CATEGORY_KEYWORDS: dict[str, list[str]] = {
+    "Politics": [
+        "president", "senate", "congress", "election", "vote", "democrat",
+        "republican", "governor", "mayor", "primary", "kxpres", "controls-",
+        "senat", "kxvote", "kxcanal", "kxlamayoradvance",
+    ],
+    "Economics": [
+        "fed", "gdp", "inflation", "bond", "price index", "dollar", "bitcoin",
+        "crypto", "oil", "interest rate", "kxbond", "kxfed", "kxbtc",
+        "kxgtaprice", "kxgreenlandprice",
+    ],
+    "Sports": [
+        "nba", "nfl", "mlb", "nhl", "super bowl", "championship", "world cup",
+        "wimbledon", "playoff", "mvp", "kxnba", "kxnfl", "kxmlb", "kxnhl",
+        "kxsb-", "kxmenworldcup", "kxnbawest",
+    ],
+    "Entertainment": [
+        "oscar", "emmy", "grammy", "award", "actor", "actress", "movie",
+        "celebrity", "taylor swift", "bond film", "james bond",
+        "kxoscar", "kxswift", "kxbond-",
+    ],
+    "Science/Tech": [
+        "spacex", "nasa", "launch", "satellite", "alien", "climate",
+        "temperature", "greenland", "ai model", "kxspacex", "kxgreenland",
+        "kxaliens", "kxustests",
+    ],
+}
+
+
+def _category(market_id: str, question: str) -> str:
+    """Infer a broad category from market ID and question text."""
+    combined = (market_id + " " + question).lower()
+    for cat, keywords in _CATEGORY_KEYWORDS.items():
+        if any(kw in combined for kw in keywords):
+            return cat
+    return "Other"
+
+
 _FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```")
 _TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
 
@@ -142,7 +184,8 @@ class TextReviewStage(ReviewStage):
     ) -> dict:
         candidates_text = "\n".join(
             f"{m.market_id} | {m.question[:80]} | "
-            f"{m.yes_bid:.2f}/{m.yes_ask:.2f} | ${m.volume_24h:.0f}"
+            f"{m.yes_bid:.2f}/{m.yes_ask:.2f} | ${m.volume_24h:.0f} "
+            f"[{_category(m.market_id, m.question)}]"
             for m in candidates
         )
 
@@ -179,6 +222,10 @@ SKIP markets where:
 - Price is below 0.10 or above 0.90 (near resolution, limited upside)
 - You have no way to research or form a view
 - Question is too vague or ambiguous
+
+DIVERSITY RULE: Select at most 2 markets from any single category. \
+Aim for markets from at least 3 different categories. \
+Each market's category is shown in [brackets] after its line.
 
 OUTPUT RULES — read carefully:
 - Output ONLY a JSON object. No prose, no markdown fences, no function calls.
