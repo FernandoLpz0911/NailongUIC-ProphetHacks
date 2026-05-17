@@ -16,6 +16,8 @@ jobs:
   run-agent:
     name: "nailong_${{ github.run_number }} (26 ticks)"
     runs-on: ubuntu-latest
+
+    environment: Autorun
     # 26 ticks × 15 min + ~15 min first-tick wait + buffer = ~420 min.
     # Note: GitHub free tier caps jobs at 360 min; a paid plan is recommended.
     timeout-minutes: 420
