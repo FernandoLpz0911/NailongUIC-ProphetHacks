@@ -151,6 +151,18 @@ class RiskConfig:
     stop_loss_threshold: float = field(
         default_factory=lambda: _env_float("STOP_LOSS_THRESHOLD", 0.20)
     )
+    # Time-to-resolution preference (favor sooner-ending contracts).
+    # The 14-day comp window only realizes PnL on markets that resolve in-window,
+    # so we skip far-out markets entirely and de-size mid-horizon ones.
+    max_days_to_resolution: float = field(
+        default_factory=lambda: _env_float("MAX_DAYS_TO_RESOLUTION", 21.0)
+    )
+    near_term_horizon_days: float = field(
+        default_factory=lambda: _env_float("NEAR_TERM_HORIZON_DAYS", 7.0)
+    )
+    far_term_size_floor: float = field(
+        default_factory=lambda: _env_float("FAR_TERM_SIZE_FLOOR", 0.30)
+    )
 
 
 @dataclass(frozen=True)

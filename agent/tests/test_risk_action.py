@@ -44,13 +44,14 @@ def make_market(
     yes_bid: float = 0.48,
     yes_ask: float = 0.52,
     volume_24h: float = 5000.0,
+    resolution_days: float = 10.0,
 ) -> CandidateMarket:
     yes_mark = (yes_bid + yes_ask) / 2.0
     return CandidateMarket(
         market_id=market_id,
         question=question,
         description=None,
-        resolution_time=datetime.now(timezone.utc) + timedelta(days=10),
+        resolution_time=datetime.now(timezone.utc) + timedelta(days=resolution_days),
         yes_bid=yes_bid,
         yes_ask=yes_ask,
         yes_mark=yes_mark,
@@ -758,3 +759,85 @@ def test_category_cap_respects_sort_by_edge():
     intent_ids = {i["market_id"] for i in out.data["intents"]}
     assert len(intent_ids) == 2
     assert "S_LOW" not in intent_ids  # lowest edge dropped by cap
+
+
+# ---------------------------------------------------------------------------
+# Time-to-resolution preference (bias toward sooner-ending contracts)
+# ---------------------------------------------------------------------------
+
+def test_far_dated_market_skipped_on_new_buy():
+    # Resolution 60 days out is well outside the comp window -> no new BUY.
+    m = make_market("M_FAR", yes_bid=0.36, yes_ask=0.40, resolution_days=60.0)
+    tick = make_tick(candidates=[m])
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result({"M_FAR": {"p_yes": 0.60, "rationale": ""}}))
+    assert out.data["intents"] == []
+
+
+def test_resolved_market_skipped_on_new_buy():
+    # Resolution in the past -> nothing to trade.
+    m = make_market("M_PAST", yes_bid=0.36, yes_ask=0.40, resolution_days=-1.0)
+    tick = make_tick(candidates=[m])
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result({"M_PAST": {"p_yes": 0.60, "rationale": ""}}))
+    assert out.data["intents"] == []
+
+
+def test_near_term_market_sized_larger_than_mid_horizon():
+    # Same edge, same price — only resolution_days differs. The near-term
+    # contract must get strictly more capital than the mid-horizon one.
+    # Use default equity ($10k) so the per-market notional cap ($1000) does
+    # not bind for both and mask the time multiplier.
+    near = make_market(
+        "M_NEAR", yes_bid=0.36, yes_ask=0.40, resolution_days=3.0,
+    )
+    far = make_market(
+        "M_MID", yes_bid=0.36, yes_ask=0.40, resolution_days=18.0,
+    )
+
+    stage_near = make_stage()
+    out_near = stage_near.execute(
+        make_tick(candidates=[near]),
+        forecast_result({"M_NEAR": {"p_yes": 0.60, "rationale": ""}}),
+    )
+    stage_far = make_stage()
+    out_far = stage_far.execute(
+        make_tick(candidates=[far]),
+        forecast_result({"M_MID": {"p_yes": 0.60, "rationale": ""}}),
+    )
+
+    near_size = out_near.data["decisions"]["M_NEAR"]["size_usd"]
+    far_size = out_far.data["decisions"]["M_MID"]["size_usd"]
+    assert near_size > far_size
+    # At resolution_days=18 the linear taper gives a multiplier well under 1,
+    # so the far size should be visibly smaller (not just 1% under).
+    assert far_size < 0.85 * near_size
+
+
+def test_horizon_max_configurable():
+    # Tighten max_days_to_resolution to 10; a 14-day market should now be skipped.
+    m = make_market("M_14D", yes_bid=0.36, yes_ask=0.40, resolution_days=14.0)
+    tick = make_tick(candidates=[m])
+    stage_tight = RiskAwareActionStage(
+        llm_client=None,
+        constraints=TradingConstraints(),
+        risk=RiskConfig(max_days_to_resolution=10.0),
+    )
+    out = stage_tight.execute(
+        tick, forecast_result({"M_14D": {"p_yes": 0.60, "rationale": ""}})
+    )
+    assert out.data["intents"] == []
+
+
+def test_horizon_gate_does_not_block_flip_as_sell():
+    # We hold YES on a far-dated market and the forecast now prefers NO.
+    # The horizon gate must NOT prevent us from closing the stale position.
+    m = make_market("M_FAR", yes_bid=0.78, yes_ask=0.80, resolution_days=90.0)
+    held = make_position("M_FAR", "YES", shares=40.0, avg_entry=0.50)
+    tick = make_tick(candidates=[m], positions=[held])
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result({"M_FAR": {"p_yes": 0.20, "rationale": "flip"}}))
+    assert len(out.data["intents"]) == 1
+    assert out.data["intents"][0]["action"] == "SELL"
+    assert out.data["intents"][0]["side"] == "YES"

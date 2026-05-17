@@ -13,6 +13,7 @@ import json
 import logging
 import re
 from collections.abc import Sequence
+from datetime import datetime, timezone
 
 from ai_prophet.trade.agent.stages.review import ReviewStage
 from ai_prophet.trade.agent.utils import format_portfolio_summary
@@ -22,6 +23,31 @@ from ai_prophet.trade.llm import LLMMessage
 from ai_prophet.trade.llm.base import LLMRequest
 
 logger = logging.getLogger(__name__)
+
+# Review-stage horizon for "won't resolve in the comp window". The risk-action
+# stage enforces its own (tighter) cap via RiskConfig.max_days_to_resolution;
+# this one is intentionally looser so the LLM still sees borderline cases and
+# can prioritize the near-term ones.
+REVIEW_MAX_DAYS_TO_RESOLUTION = 28.0
+REVIEW_NEAR_TERM_DAYS = 14.0
+
+
+def _coerce_tz_aware(value: object) -> datetime | None:
+    """Best-effort coercion of a tick timestamp into a tz-aware datetime.
+
+    Accepts a `datetime` (returned as-is or UTC-stamped if naive) or an ISO
+    string. Anything else returns None — callers should treat that as "no
+    horizon info available" and fall back to volume-only sorting.
+    """
+    if isinstance(value, datetime):
+        return value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str):
+        try:
+            parsed = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo is not None else parsed.replace(tzinfo=timezone.utc)
+    return None
 
 # ---------------------------------------------------------------------------
 # Category classification — used to label candidates and enforce diversity.
@@ -186,26 +212,77 @@ class TextReviewStage(ReviewStage):
             m for m in candidates
             if 0.08 < (float(m.yes_bid) + float(m.yes_ask)) / 2.0 < 0.92
         ]
-        # Deprioritize long-horizon markets (year >= 2027 in ID or question).
-        # These won't resolve in the 14-day competition window; sort them last
-        # so the LLM sees near-term markets first in its capped list of 80.
-        def _is_long_horizon(m: object) -> bool:
+
+        # Use the real resolution_time to rank candidates: drop anything that
+        # can't realistically resolve inside the comp window, then sort so the
+        # LLM sees soonest-resolving / highest-volume markets first in its
+        # capped list of 80. Falls back to the legacy year-string heuristic
+        # when resolution_time is missing or malformed.
+        ref_ts = _coerce_tz_aware(getattr(tick_ctx, "tick_ts", None))
+
+        def _days_to_res(m: object) -> float | None:
+            if ref_ts is None:
+                return None
+            res = getattr(m, "resolution_time", None)
+            if not isinstance(res, datetime):
+                return None
+            if res.tzinfo is None:
+                res = res.replace(tzinfo=timezone.utc)
+            return (res - ref_ts).total_seconds() / 86400.0
+
+        def _is_long_horizon_fallback(m: object) -> bool:
             text = (getattr(m, "market_id", "") + " "
                     + getattr(m, "question", "")).lower()
             return any(f"-{y}" in text or f" {y}" in text
                        for y in ("2027", "2028", "2029", "2030"))
 
-        active.sort(
+        def _horizon_bucket(m: object) -> int:
+            """Lower = preferred. 0 near-term, 1 mid, 2 far/unknown, 3 past."""
+            d = _days_to_res(m)
+            if d is None:
+                return 2 if _is_long_horizon_fallback(m) else 1
+            if d <= 0:
+                return 3
+            if d <= REVIEW_NEAR_TERM_DAYS:
+                return 0
+            if d <= REVIEW_MAX_DAYS_TO_RESOLUTION:
+                return 1
+            return 2
+
+        # Drop markets that have already resolved and ones so far out they
+        # can't pay off in-window. Keep "unknown horizon" markets — the LLM
+        # may still want them and the action stage's gate will catch any
+        # genuinely far-dated ones.
+        filtered: list[CandidateMarket] = []
+        for m in active:
+            d = _days_to_res(m)
+            if d is not None and d <= 0:
+                continue
+            if d is not None and d > REVIEW_MAX_DAYS_TO_RESOLUTION:
+                continue
+            if d is None and _is_long_horizon_fallback(m):
+                continue
+            filtered.append(m)
+
+        filtered.sort(
             key=lambda m: (
-                _is_long_horizon(m),          # long-horizon goes last
-                -float(m.volume_24h or 0),    # then highest volume first
+                _horizon_bucket(m),           # near-term first
+                _days_to_res(m) or 9999.0,    # within bucket: soonest first
+                -float(m.volume_24h or 0),    # tiebreak on liquidity
             )
         )
-        candidates = active[:80] if len(active) > 80 else active
+        candidates = filtered[:80] if len(filtered) > 80 else filtered
+
+        def _horizon_label(m: object) -> str:
+            d = _days_to_res(m)
+            if d is None:
+                return "?d"
+            return f"{d:.0f}d"
 
         candidates_text = "\n".join(
             f"{m.market_id} | {m.question[:80]} | "
             f"{m.yes_bid:.2f}/{m.yes_ask:.2f} | ${m.volume_24h:.0f} "
+            f"| res-in {_horizon_label(m)} "
             f"[{_category(m.market_id, m.question)}]"
             for m in candidates
         )
@@ -240,21 +317,23 @@ THIS IS A 14-DAY COMPETITION. The only reliable P&L path is resolution gains
 A position in "2028 elections" or "2029 policy" will never resolve; it just
 drifts on sentiment and bleeds spread costs every tick.
 
+Each market line includes `res-in Nd` — the exact number of DAYS until that
+contract resolves (or `?d` if unknown). Use this as your primary filter.
+
 STRONGLY PREFER markets that:
-- Resolve within the next 2-4 weeks (look for near-term dates in the question)
+- Have `res-in` ≤ 14d (will resolve inside the comp window — realized PnL)
 - Are about ongoing events with imminent conclusions: active playoffs, votes
   happening this week, scheduled announcements, earnings in the next few days
 - Have high 24h volume (>$5,000) — volume signals near-term resolution activity
 
 GOOD REASONS TO SELECT:
-- The event resolves soon and recent news may not be priced in yet
+- `res-in` is small and recent news may not be priced in yet
 - An ongoing sports series, trial, vote, or announcement is days away
 - The probability seems clearly off vs. publicly available information
 
 SKIP markets where:
 - Price is below 0.10 or above 0.90 (near resolution, limited upside)
-- The question contains a year ≥ 2027 (too far out to resolve in competition)
-- The event is more than 6 weeks away (won't resolve; pure sentiment drift)
+- `res-in` > 21d (won't resolve in comp window; pure sentiment drift)
 - You have no way to research or form a view
 - Question is too vague or ambiguous
 

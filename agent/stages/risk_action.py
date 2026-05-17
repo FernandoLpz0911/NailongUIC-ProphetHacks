@@ -27,6 +27,7 @@ side, shares, rationale.
 from __future__ import annotations
 
 import logging
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import Any
 
@@ -36,6 +37,7 @@ from ai_prophet.trade.core import TickContext
 from ai_prophet.trade.core.tick_context import CandidateMarket
 from ai_prophet.trade.llm import LLMClient
 
+from agent.calibration import resolution_proximity_multiplier
 from agent.settings import RiskConfig, TradingConstraints
 from agent.stages.text_review import _category
 
@@ -304,6 +306,19 @@ class RiskAwareActionStage(ActionStage):
             )
             return None
 
+        # Time-to-resolution gate: prefer contracts that resolve inside the
+        # 14-day comp window. Computed once here so the BUY path can both
+        # hard-skip far-out markets and shrink mid-horizon ones in sizing.
+        # The flip-as-sell path below intentionally bypasses this (we always
+        # want to close stale positions, even on far-dated markets).
+        days_to_res = _days_to_resolution(market, tick_ctx)
+        time_mult = resolution_proximity_multiplier(
+            days_to_res if days_to_res is not None else 0.0,
+            near_term_days=self.risk.near_term_horizon_days,
+            max_days=self.risk.max_days_to_resolution,
+            floor=self.risk.far_term_size_floor,
+        ) if days_to_res is not None else 1.0
+
         p_yes = _clamp01(p_yes)
         p_no = 1.0 - p_yes
 
@@ -381,6 +396,15 @@ class RiskAwareActionStage(ActionStage):
         # ------------------------------------------------------------------
         # Standard BUY path with Volatility Penalization.
         # ------------------------------------------------------------------
+        # Hard time-to-resolution gate. Days outside [0, max_days_to_resolution]
+        # collapse to time_mult == 0; skip opening a new position there.
+        if days_to_res is not None and time_mult <= 0.0:
+            logger.debug(
+                "Action: skip %s, days_to_resolution=%.1f outside [0, %.1f]",
+                market_id, days_to_res, self.risk.max_days_to_resolution,
+            )
+            return None
+
         if best_price <= 0 or best_price >= 1.0:
             return None  # Degenerate or resolved-near-expiry market.
 
@@ -438,8 +462,9 @@ class RiskAwareActionStage(ActionStage):
             self.risk.kelly_fraction
             * shrink
             * base_kelly
-            * sharpe_dampener  
-            * heat_penalty     
+            * sharpe_dampener
+            * heat_penalty
+            * time_mult        # bias capital toward sooner-resolving contracts
         )
 
         kelly_frac = max(0.0, min(self.risk.max_position_pct_of_equity, kelly_frac))
@@ -468,7 +493,9 @@ class RiskAwareActionStage(ActionStage):
             "rationale": (
                 f"edge={best_edge:+.3f} (p_yes={p_yes:.3f}, price={best_price:.3f}); "
                 f"adj-Kelly size ${size_usd:.0f} (heat_pen={heat_penalty:.2f}, "
-                f"sharpe_pen={sharpe_dampener:.2f}). {rationale}"
+                f"sharpe_pen={sharpe_dampener:.2f}, time_mult={time_mult:.2f}"
+                f"{f', days_to_res={days_to_res:.1f}' if days_to_res is not None else ''})."
+                f" {rationale}"
             ).strip(),
             "p_yes":             p_yes,
             "p_no":              p_no,
@@ -650,3 +677,25 @@ def _clamp01(x: float) -> float:
     if x > 1.0:
         return 1.0
     return float(x)
+
+
+def _days_to_resolution(
+    market: CandidateMarket, tick_ctx: TickContext
+) -> float | None:
+    """Days between the tick boundary and the market's resolution time.
+
+    Returns None when the market has no usable resolution_time (defensive — we
+    treat that as "unknown horizon" and let the trade proceed at full size
+    rather than over-filtering on malformed data).
+    """
+    res = getattr(market, "resolution_time", None)
+    if not isinstance(res, datetime):
+        return None
+    tick_ts = tick_ctx.tick_ts
+    # Both should be tz-aware per the SDK contract; if either is naive, assume
+    # UTC so the subtraction doesn't raise.
+    if res.tzinfo is None:
+        res = res.replace(tzinfo=timezone.utc)
+    if tick_ts.tzinfo is None:
+        tick_ts = tick_ts.replace(tzinfo=timezone.utc)
+    return (res - tick_ts).total_seconds() / 86400.0

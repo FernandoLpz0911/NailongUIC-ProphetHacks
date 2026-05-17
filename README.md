@@ -27,6 +27,14 @@ Every 15 minutes, for each candidate prediction market on Prophet Arena:
    `MAX_OPEN_POSITIONS=30`, `MAX_TRADES_PER_TICK=20`. The deterministic
    sizer also obeys the position-flip-as-sell rule and relaxes the
    minimum-edge threshold when on pace to undershoot the 14-trade floor.
+   It biases capital toward **sooner-resolving contracts**: markets
+   resolving more than `MAX_DAYS_TO_RESOLUTION` (default 21d) out are
+   skipped, those within `NEAR_TERM_HORIZON_DAYS` (default 7d) get full
+   Kelly size, and the in-between band tapers linearly down to
+   `FAR_TERM_SIZE_FLOOR` (default 0.30). Realized PnL during the 14-day
+   evaluation only comes from in-window resolutions, so this directly
+   targets the scoring metric. The review stage uses the same horizon
+   signal to rank candidates before sending them to the LLM.
 
 The SDK's [`ExperimentRunner`](packages/cli/ai_prophet/trade/runner.py)
 handles the tick loop, lease management, portfolio fetch, intent
@@ -120,6 +128,9 @@ Override any `RuntimeConfig` field by setting the matching env var (see
 | `MIN_EDGE` | `0.05` | Standard trade gate |
 | `MIN_EDGE_RELAXED` | `0.03` | Used when lifetime fills < 14 |
 | `KELLY_FRACTION` | `0.5` | Half-Kelly by default |
+| `MAX_DAYS_TO_RESOLUTION` | `21` | Hard skip on new BUYs for markets resolving more than this many days out |
+| `NEAR_TERM_HORIZON_DAYS` | `7` | Within this many days of resolution → full Kelly size; mid-horizon tapers down |
+| `FAR_TERM_SIZE_FLOOR` | `0.30` | Sizing multiplier just inside the max-days boundary (linear taper anchor) |
 | `KILL_SWITCH_USD` | `180` | Cumulative spend at which forecasts fall back to market mid |
 
 ---

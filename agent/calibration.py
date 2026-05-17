@@ -132,6 +132,41 @@ def dynamic_alpha(
     return min(max(base + adj, 0.15), 0.85)
 
 
+def resolution_proximity_multiplier(
+    days_to_resolution: float,
+    *,
+    near_term_days: float,
+    max_days: float,
+    floor: float,
+) -> float:
+    """Sizing multiplier that rewards contracts resolving sooner.
+
+    The 14-day Trading-Track evaluation window only realizes PnL on markets
+    that actually resolve in-window. A position in a 6-month market just
+    drifts on sentiment and bleeds spread costs — capital is better spent on
+    contracts that will pay out (or fail) before May 31.
+
+    Shape (piecewise-linear):
+      * `days <= 0`              -> 0.0   (already resolved / past resolution)
+      * `0 < days <= near_term`  -> 1.0   (full size; sweet spot)
+      * `near_term < days < max` -> linear taper from 1.0 down to `floor`
+      * `days >= max`            -> 0.0   (hard skip; far outside comp window)
+
+    Callers should treat a return of 0.0 as "do not trade this market".
+    """
+    if days_to_resolution <= 0.0:
+        return 0.0
+    if days_to_resolution >= max_days:
+        return 0.0
+    if days_to_resolution <= near_term_days:
+        return 1.0
+    if max_days <= near_term_days:
+        return 1.0  # degenerate config; behave as if every in-window market is near-term
+    floor = max(0.0, min(1.0, floor))
+    progress = (days_to_resolution - near_term_days) / (max_days - near_term_days)
+    return 1.0 - progress * (1.0 - floor)
+
+
 def epistemic_shrink(p: float, llm_var: float) -> float:
     """James-Stein shrinkage factor for Kelly sizing under LLM estimation uncertainty.
 

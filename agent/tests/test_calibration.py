@@ -17,6 +17,7 @@ from agent.calibration import (
     epistemic_shrink,
     market_mid,
     polymarket_consensus,
+    resolution_proximity_multiplier,
 )
 from agent.settings import CalibrationConfig
 
@@ -234,3 +235,50 @@ def test_epistemic_shrink_reduces_with_high_variance():
 def test_epistemic_shrink_clamps_at_zero_p():
     # At p=0 or p=1, naive_var=0; shrink should be 1.0 (no Kelly anyway).
     assert epistemic_shrink(0.0, 0.0) == pytest.approx(1.0)
+
+
+# ---------------------------------------------------------------------------
+# resolution_proximity_multiplier — bias toward sooner-resolving contracts
+# ---------------------------------------------------------------------------
+
+def _rpm(days: float) -> float:
+    return resolution_proximity_multiplier(
+        days, near_term_days=7.0, max_days=21.0, floor=0.30,
+    )
+
+
+def test_rpm_zero_when_already_resolved():
+    assert _rpm(0.0) == pytest.approx(0.0)
+    assert _rpm(-3.0) == pytest.approx(0.0)
+
+
+def test_rpm_zero_beyond_max_days():
+    assert _rpm(21.0) == pytest.approx(0.0)
+    assert _rpm(60.0) == pytest.approx(0.0)
+
+
+def test_rpm_full_size_inside_near_term():
+    assert _rpm(0.5) == pytest.approx(1.0)
+    assert _rpm(7.0) == pytest.approx(1.0)
+
+
+def test_rpm_tapers_linearly_between_near_and_max():
+    # midpoint of (7, 21] should give multiplier midway between 1.0 and floor.
+    # midpoint = 14; progress = 0.5; multiplier = 1 - 0.5*(1 - 0.30) = 0.65
+    assert _rpm(14.0) == pytest.approx(0.65)
+
+
+def test_rpm_monotonic_decreasing_in_taper_zone():
+    # Strictly decreasing across the taper zone.
+    prev = _rpm(7.0 + 1e-3)
+    for d in [9.0, 11.0, 14.0, 17.0, 20.0]:
+        cur = _rpm(d)
+        assert cur < prev
+        prev = cur
+
+
+def test_rpm_degenerate_config_does_not_crash():
+    # max_days <= near_term_days is operator error, but shouldn't NaN out.
+    assert resolution_proximity_multiplier(
+        5.0, near_term_days=7.0, max_days=7.0, floor=0.30,
+    ) == pytest.approx(1.0)
