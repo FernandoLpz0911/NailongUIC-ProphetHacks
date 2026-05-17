@@ -24,8 +24,6 @@ jobs:
       PA_SERVER_API_KEY: ${{ secrets.PA_SERVER_API_KEY }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
-      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       OPENROUTER_BASE_URL: https://openrouter.ai/api/v1
       OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
       KILL_SWITCH_USD: "100"
