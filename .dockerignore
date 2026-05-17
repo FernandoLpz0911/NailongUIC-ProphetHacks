@@ -1,0 +1,38 @@
+# Virtual environment
+.venv/
+venv/
+
+# Secrets — never bake into the image
+.env
+
+# Git history
+.git/
+.github/
+
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.so
+
+# Runtime artifacts — mounted as a volume at /app/data in production
+data/
+costs.sqlite
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.log
+*.log.*
+
+# SDK memory (generated at runtime)
+.pa_memory/
+
+# Deploy scripts (not needed inside the container)
+deploy/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*.swo

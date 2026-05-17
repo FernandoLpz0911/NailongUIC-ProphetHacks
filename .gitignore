@@ -229,3 +229,13 @@ costs.sqlite
 
 # Local SDK reasoning memory (default PA_MEMORY_DIR)
 .pa_memory/
+
+# Vendored Google Cloud SDK installer (downloaded by deploy/setup.sh for WSL
+# bootstrap; never commit — it's ~90 MB and platform-specific)
+google-cloud-sdk/
+google-cloud-cli-linux-x86_64.tar.gz
+
+# Local run logs we accidentally committed before
+smoke_v*.log
+soak_v*.log
+agent.log

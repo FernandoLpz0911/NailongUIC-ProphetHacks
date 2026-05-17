@@ -1,0 +1,101 @@
+# =============================================================================
+# Cloud Build pipeline — fires on every push to the repo's default branch
+# (currently `refactor-connection`; the branch is configured on the trigger,
+# not in this file, so this pipeline is branch-agnostic).
+#
+# Flow:  lint → test → docker build → push to Artifact Registry → SSH deploy
+#
+# Required substitutions (auto-provided by Cloud Build):
+#   $PROJECT_ID   — GCP project  (project-c31af50d-0e9f-45fd-a5c)
+#   $COMMIT_SHA   — git SHA of the triggering commit
+#
+# Required substitutions (set in the trigger definition):
+#   $_ZONE        — Compute Engine zone  (us-central1-a)
+#   $_VM_NAME     — VM instance name     (nailong-agent)
+#   $_REGION      — Artifact Registry region (us-central1)
+# =============================================================================
+
+substitutions:
+  _ZONE:    us-central1-a
+  _VM_NAME: nailong-agent
+  _REGION:  us-central1
+
+steps:
+  # ── 1. Lint (Ruff) ───────────────────────────────────────────────────────
+  - id: lint
+    name: python:3.11-slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        pip install -q -e "packages/cli[dev]"
+        python -m ruff check --config packages/cli/pyproject.toml packages/core packages/cli
+
+  # ── 2. Unit tests ────────────────────────────────────────────────────────
+  - id: test
+    name: python:3.11-slim
+    entrypoint: bash
+    args:
+      - -c
+      - |
+        pip install -q -e "packages/core[mcp]" -e "packages/cli[dev]" -r requirements.txt
+        pytest packages/core/tests packages/cli/tests agent/tests -q --tb=short
+    waitFor: [lint]
+
+  # ── 3. Build Docker image ────────────────────────────────────────────────
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/nailong/agent:$COMMIT_SHA
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/nailong/agent:latest
+      - .
+    waitFor: [test]
+
+  # ── 4. Push to Artifact Registry ─────────────────────────────────────────
+  - id: push
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - --all-tags
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/nailong/agent
+    waitFor: [build]
+
+  # ── 5. Copy the latest deploy script to the VM ───────────────────────────
+  - id: upload-deploy-script
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - compute
+      - scp
+      - deploy/vm-deploy.sh
+      - ${_VM_NAME}:/opt/nailong/vm-deploy.sh
+      - --zone=${_ZONE}
+      - --tunnel-through-iap
+    waitFor: [push]
+
+  # ── 6. Roll out new image on the Compute Engine VM ────────────────────────
+  - id: deploy
+    name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - compute
+      - ssh
+      - ${_VM_NAME}
+      - --zone=${_ZONE}
+      - --tunnel-through-iap
+      - --command
+      - >-
+        chmod +x /opt/nailong/vm-deploy.sh &&
+        /opt/nailong/vm-deploy.sh
+        ${_REGION}-docker.pkg.dev/$PROJECT_ID/nailong/agent:$COMMIT_SHA
+    waitFor: [upload-deploy-script]
+
+images:
+  - ${_REGION}-docker.pkg.dev/$PROJECT_ID/nailong/agent
+
+options:
+  logging: CLOUD_LOGGING_ONLY
+  machineType: E2_HIGHCPU_8
