@@ -6,6 +6,7 @@ substantive difference is that we hand ExperimentRunner our custom
 `build_pipeline` callback from `agent.pipeline`.
 
 Defaults are tuned for the 14-day eval window:
+
   --slug      nailong_v01
   --max-ticks 1344   (14 days * 24h * 4 ticks/h)
   --starting-cash 10000 (matches INITIAL_CASH from constants.csv)
