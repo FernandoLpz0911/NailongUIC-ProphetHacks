@@ -235,6 +235,9 @@ costs.sqlite
 google-cloud-sdk/
 google-cloud-cli-linux-x86_64.tar.gz
 
+# Claude Code local state (worktrees, settings, session data)
+.claude/
+
 # Local run logs we accidentally committed before
 smoke_v*.log
 soak_v*.log
