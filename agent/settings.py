@@ -151,7 +151,6 @@ class RuntimeConfig:
     # Operator-set knobs from .env
     pa_server_url: str = field(default_factory=lambda: os.getenv("PA_SERVER_URL", "https://api.aiprophet.dev"))
     pa_server_api_key: str | None = field(default_factory=lambda: os.getenv("PA_SERVER_API_KEY") or None)
-    openrouter_api_key: str | None = field(default_factory=lambda: os.getenv("OPENROUTER_API_KEY") or None)
     brave_api_key: str | None = field(default_factory=lambda: os.getenv("BRAVE_API_KEY") or None)
     tavily_api_key: str | None = field(default_factory=lambda: os.getenv("TAVILY_API_KEY") or None)
 

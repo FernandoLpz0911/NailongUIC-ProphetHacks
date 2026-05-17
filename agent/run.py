@@ -9,7 +9,7 @@ Defaults are tuned for the 14-day eval window:
   --slug      nailong_v01
   --max-ticks 1344   (14 days * 24h * 4 ticks/h)
   --starting-cash 10000 (matches INITIAL_CASH from constants.csv)
-  -m          openrouter:anthropic/claude-sonnet-4 (per .env DEFAULT_MODEL)
+  -m          gemini:gemini-3.1-pro
 
 Use --dry to wire everything up but skip `runner.run()` so you can verify
 the build_pipeline closure resolves credentials without burning a tick lease.
@@ -46,7 +46,7 @@ def _setup_logging(verbose: bool, log_level: str) -> None:
 @click.command()
 @click.option(
     "-m", "--models", multiple=True,
-    default=("openrouter:anthropic/claude-sonnet-4-5",),
+    default=("gemini:gemini-3.1-pro",),
     show_default=True,
     help="Model specs (provider:model). Repeatable.",
 )
