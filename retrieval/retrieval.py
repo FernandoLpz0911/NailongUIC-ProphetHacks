@@ -46,6 +46,7 @@ _DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 CACHE_DIR = _DATA_DIR / "cache" / "search"
 CACHE_TTL_SECONDS = 60 * 60 * 24
+RAW_SEARCH_CACHE_TTL = int(os.getenv("SEARCH_CACHE_TTL_SECONDS", str(4 * 60 * 60)))  # 4 hours
 CSV_LOG = _DATA_DIR / "retrieval_log.csv"
 
 cache = diskcache.Cache(str(CACHE_DIR))
@@ -244,9 +245,20 @@ def raw_search(query: str, max_results: int = 5) -> list[dict]:
     Returns SDK-shaped dicts: {url, title, snippet, text, score}.
     Filtering (blocked domains, dedup) and category-aware ranking happen in
     the adapter so this function stays a thin wrapper around the providers.
+
+    Results are cached for RAW_SEARCH_CACHE_TTL seconds (default 4 hours) to
+    avoid burning search credits on identical queries across ticks.
     """
+    cache_key = f"raw:{query}:{max_results}"
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached
+
     chunks = _search_one_query(query, max_results=max_results)
-    return [_to_sdk_shape(c) for c in chunks]
+    result = [_to_sdk_shape(c) for c in chunks]
+    if result:
+        cache.set(cache_key, result, expire=RAW_SEARCH_CACHE_TTL)
+    return result
 
 
 def _search_one_query(query: str, max_results: int = 5) -> list[dict]:
@@ -256,7 +268,7 @@ def _search_one_query(query: str, max_results: int = 5) -> list[dict]:
             results = tavily_client.search(
                 query=query,
                 max_results=max_results,
-                search_depth="advanced",
+                search_depth="basic",
             )
             hits = results.get("results", []) or []
             if hits:
@@ -354,7 +366,7 @@ def fetch_with_fallback(queries: list[str]) -> list[dict]:
                 results = tavily_client.search(
                     query=query,
                     max_results=5,
-                    search_depth="advanced",
+                    search_depth="basic",
                 )
                 chunks.extend(results.get("results", []) or [])
                 continue
