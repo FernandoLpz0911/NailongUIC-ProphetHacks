@@ -37,6 +37,7 @@ from ai_prophet.trade.core.tick_context import CandidateMarket
 from ai_prophet.trade.llm import LLMClient
 
 from agent.settings import RiskConfig, TradingConstraints
+from agent.stages.text_review import _category
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +147,7 @@ class RiskAwareActionStage(ActionStage):
         decisions: dict[str, dict[str, Any]] = {}
         running_notional = 0.0
         new_positions_opened = 0
+        category_counts: dict[str, int] = {}
 
         for d in scored:
             if len(intents) >= self.constraints.max_trades_per_tick:
@@ -176,12 +178,21 @@ class RiskAwareActionStage(ActionStage):
                 if size_usd < self.min_size_usd:
                     continue
 
+            cat = _category(mid, d.get("question", ""))
+            if category_counts.get(cat, 0) >= self.constraints.max_intents_per_category:
+                logger.info(
+                    "Action: skip %s [%s], category cap %d reached",
+                    mid, cat, self.constraints.max_intents_per_category,
+                )
+                continue
+
             intent = self._to_intent(d, tick_ctx, equity_now=equity)
             if intent is None:
                 continue
 
             intents.append(intent)
             decisions[mid] = self._decision_summary(d, equity_now=equity)
+            category_counts[cat] = category_counts.get(cat, 0) + 1
             running_notional += size_usd
             if is_new_position:
                 new_positions_opened += 1

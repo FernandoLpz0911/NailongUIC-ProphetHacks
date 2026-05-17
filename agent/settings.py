@@ -87,6 +87,9 @@ class TradingConstraints:
     max_intents_per_tick_request: int = field(
         default_factory=lambda: int(_csv_float("MAX_INTENTS_PER_TICK_REQUEST", 50))
     )
+    max_intents_per_category: int = field(
+        default_factory=lambda: _env_int("MAX_INTENTS_PER_CATEGORY", 2)
+    )
     fee_rate: float = field(default_factory=lambda: _csv_float("FEE_RATE", 0.0))
     tick_interval_seconds: int = field(
         default_factory=lambda: int(_csv_float("TICK_INTERVAL_SECONDS", 900))

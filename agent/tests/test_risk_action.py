@@ -227,13 +227,15 @@ def test_max_trades_per_tick_truncates():
     # keeps each trade small enough that MAX_GROSS_EXPOSURE doesn't bind
     # first: equity=$5k -> 5% cap = $250/trade, 25*$250=$6.25k < $10k cap,
     # so MAX_TRADES_PER_TICK=20 should be the binding limit.
+    # Use max_intents_per_category=25 so the category cap doesn't bind first.
     markets = [
         make_market(f"M{i}", yes_bid=0.36, yes_ask=0.40) for i in range(25)
     ]
     tick = make_tick(candidates=markets, equity=5_000.0)
     forecasts = {f"M{i}": {"p_yes": 0.60, "rationale": ""} for i in range(25)}
 
-    stage = make_stage()
+    constraints = TradingConstraints(max_intents_per_category=25)
+    stage = _make_stage_with_constraints(constraints)
     out = stage.execute(tick, forecast_result(forecasts))
     assert len(out.data["intents"]) == 20  # MAX_TRADES_PER_TICK
 
@@ -324,3 +326,89 @@ def test_no_forecasts_returns_empty_success():
     out = stage.execute(tick, forecast_result({}))
     assert out.success
     assert out.data["intents"] == []
+
+
+# ---------------------------------------------------------------------------
+# Category concentration cap
+# ---------------------------------------------------------------------------
+
+def _make_stage_with_constraints(constraints: TradingConstraints, **risk_overrides) -> RiskAwareActionStage:
+    risk = RiskConfig(**risk_overrides) if risk_overrides else RiskConfig()
+    return RiskAwareActionStage(llm_client=None, constraints=constraints, risk=risk)
+
+
+def test_category_cap_limits_intents_per_category():
+    # 3 Sports markets all with strong edge -> cap at 2 intents for Sports.
+    markets = [
+        make_market(f"M{i}", yes_bid=0.36, yes_ask=0.40, question=f"Will the NBA team {i} win?")
+        for i in range(3)
+    ]
+    tick = make_tick(candidates=markets, equity=100_000.0)
+    forecasts = {f"M{i}": {"p_yes": 0.60, "rationale": ""} for i in range(3)}
+
+    constraints = TradingConstraints(max_intents_per_category=2)
+    stage = _make_stage_with_constraints(constraints)
+    out = stage.execute(tick, forecast_result(forecasts))
+
+    assert len(out.data["intents"]) == 2
+
+
+def test_category_cap_does_not_block_other_categories():
+    # 2 Sports + 2 Politics + 2 Economics: all 6 should get through.
+    markets = [
+        make_market("S1", yes_bid=0.36, yes_ask=0.40, question="Will the NBA finals go to game 7?"),
+        make_market("S2", yes_bid=0.36, yes_ask=0.40, question="Will the NFL draft pick surprise?"),
+        make_market("P1", yes_bid=0.36, yes_ask=0.40, question="Who will win the presidential election?"),
+        make_market("P2", yes_bid=0.36, yes_ask=0.40, question="Will the senate vote pass?"),
+        make_market("E1", yes_bid=0.36, yes_ask=0.40, question="Will the Fed raise interest rates?"),
+        make_market("E2", yes_bid=0.36, yes_ask=0.40, question="Will Bitcoin hit $100k?"),
+    ]
+    tick = make_tick(candidates=markets, equity=100_000.0)
+    forecasts = {m.market_id: {"p_yes": 0.60, "rationale": ""} for m in markets}
+
+    constraints = TradingConstraints(max_intents_per_category=2)
+    stage = _make_stage_with_constraints(constraints)
+    out = stage.execute(tick, forecast_result(forecasts))
+
+    assert len(out.data["intents"]) == 6
+
+
+def test_category_cap_configurable_to_one():
+    # max_intents_per_category=1 -> only 1 intent per category.
+    markets = [
+        make_market("S1", yes_bid=0.36, yes_ask=0.40, question="Will the NBA team win?"),
+        make_market("S2", yes_bid=0.36, yes_ask=0.40, question="Will the NFL game go into overtime?"),
+        make_market("E1", yes_bid=0.36, yes_ask=0.40, question="Will the Fed cut rates?"),
+        make_market("E2", yes_bid=0.36, yes_ask=0.40, question="Will Bitcoin rally?"),
+    ]
+    tick = make_tick(candidates=markets, equity=100_000.0)
+    forecasts = {m.market_id: {"p_yes": 0.60, "rationale": ""} for m in markets}
+
+    constraints = TradingConstraints(max_intents_per_category=1)
+    stage = _make_stage_with_constraints(constraints)
+    out = stage.execute(tick, forecast_result(forecasts))
+
+    assert len(out.data["intents"]) == 2  # 1 Sports + 1 Economics
+
+
+def test_category_cap_respects_sort_by_edge():
+    # 3 Sports markets with different edges -> cap keeps the 2 with highest edge.
+    markets = [
+        make_market("S_HIGH", yes_bid=0.20, yes_ask=0.25, question="Will the NBA champ repeat?"),
+        make_market("S_MED",  yes_bid=0.36, yes_ask=0.40, question="Will the NBA finals go 7 games?"),
+        make_market("S_LOW",  yes_bid=0.45, yes_ask=0.50, question="Will the NBA player score 40?"),
+    ]
+    tick = make_tick(candidates=markets, equity=100_000.0)
+    forecasts = {
+        "S_HIGH": {"p_yes": 0.70, "rationale": ""},  # edge 0.45
+        "S_MED":  {"p_yes": 0.60, "rationale": ""},  # edge 0.20
+        "S_LOW":  {"p_yes": 0.58, "rationale": ""},  # edge 0.08
+    }
+
+    constraints = TradingConstraints(max_intents_per_category=2)
+    stage = _make_stage_with_constraints(constraints)
+    out = stage.execute(tick, forecast_result(forecasts))
+
+    intent_ids = {i["market_id"] for i in out.data["intents"]}
+    assert len(intent_ids) == 2
+    assert "S_LOW" not in intent_ids  # lowest edge dropped by cap
