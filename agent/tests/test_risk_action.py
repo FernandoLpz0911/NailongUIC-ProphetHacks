@@ -245,7 +245,9 @@ def test_max_trades_per_tick_truncates():
 # ---------------------------------------------------------------------------
 
 def test_position_flip_emits_sell_on_held_side():
-    # Hold YES, but forecast now prefers NO -> emit SELL YES, not BUY NO.
+    # Hold YES, but forecast now prefers NO.
+    # Nailong Elite: same-tick SELL+BUY flip — emit SELL YES followed by
+    # BUY NO (both intents in one submission, per hackathon guide).
     m = make_market("M1", yes_bid=0.78, yes_ask=0.80)
     held = make_position("M1", "YES", shares=50.0, avg_entry=0.50)
     tick = make_tick(candidates=[m], positions=[held])
@@ -255,12 +257,19 @@ def test_position_flip_emits_sell_on_held_side():
     out = stage.execute(tick, forecast_result(forecasts))
 
     intents = out.data["intents"]
-    assert len(intents) == 1
+    # The flip may emit 1 (SELL only, no BUY leg sized) or 2 (SELL + BUY)
+    # depending on whether the BUY leg passes the min-size gate.
+    assert len(intents) >= 1
+    # First intent is always the SELL leg on the held side.
     assert intents[0]["action"] == "SELL"
     assert intents[0]["side"] == "YES"
     assert float(intents[0]["shares"]) == 50.0
     decision = out.data["decisions"]["M1"]
     assert decision["is_position_flip"] is True
+    # If a BUY leg was emitted, it must be on the new side.
+    if len(intents) == 2:
+        assert intents[1]["action"] == "BUY"
+        assert intents[1]["side"] == "NO"
 
 
 def test_no_flip_when_already_aligned():
@@ -283,15 +292,38 @@ def test_no_flip_when_already_aligned():
 # ---------------------------------------------------------------------------
 
 def test_min_edge_relaxed_when_under_trade_floor():
-    # Default min_edge 0.05 would reject p_yes 0.44 vs ask 0.40 (edge 0.04).
-    # With total_fills=0 (under floor 14), min_edge_relaxed 0.03 applies and 0.04 passes.
+    # Nailong Elite: relaxation only fires when ticks_remaining <= 100 AND
+    # total_fills < floor. We use target_total_ticks=0 so any tick is
+    # treated as "in the final stretch".
     m = make_market("M1", yes_bid=0.36, yes_ask=0.40)
     tick = make_tick(candidates=[m], total_fills=0)
     forecasts = {"M1": {"p_yes": 0.44, "rationale": ""}}
 
-    stage = make_stage()
+    stage = RiskAwareActionStage(
+        llm_client=None,
+        constraints=TradingConstraints(),
+        risk=RiskConfig(),
+        target_total_ticks=0,  # forces "final stretch" regardless of tick_index
+    )
     out = stage.execute(tick, forecast_result(forecasts))
     assert len(out.data["intents"]) == 1
+
+
+def test_min_edge_not_relaxed_outside_final_stretch():
+    # New: even if under the floor, min_edge stays strict when there are
+    # plenty of ticks remaining.
+    m = make_market("M1", yes_bid=0.36, yes_ask=0.40)
+    tick = make_tick(candidates=[m], total_fills=0)
+    forecasts = {"M1": {"p_yes": 0.44, "rationale": ""}}
+
+    stage = RiskAwareActionStage(
+        llm_client=None,
+        constraints=TradingConstraints(),
+        risk=RiskConfig(),
+        target_total_ticks=10000,  # huge horizon → no relaxation
+    )
+    out = stage.execute(tick, forecast_result(forecasts))
+    assert out.data["intents"] == []
 
 
 def test_min_edge_not_relaxed_when_at_or_above_floor():
@@ -463,12 +495,12 @@ def test_stop_loss_fires_when_loss_exceeds_threshold():
 
 
 def test_stop_loss_does_not_fire_below_threshold():
-    m = make_market("M1", yes_bid=0.42, yes_ask=0.45)
-    # Bought YES at 0.50, now marks 0.42 -> -16% loss, under 20% threshold.
+    m = make_market("M1", yes_bid=0.47, yes_ask=0.49)
+    # Bought YES at 0.50, now marks 0.47 -> -6% loss, under 10% threshold.
     from dataclasses import replace as dc_replace
     held = dc_replace(
         make_position("M1", "YES", shares=50.0, avg_entry=0.50),
-        current_price=Decimal("0.42"),
+        current_price=Decimal("0.47"),
     )
     tick = make_tick(candidates=[m], positions=[held])
 
@@ -514,24 +546,24 @@ def test_stop_loss_skips_market_from_forecast_loop():
 
 
 def test_stop_loss_threshold_configurable():
-    m = make_market("M1", yes_bid=0.42, yes_ask=0.45)
+    m = make_market("M1", yes_bid=0.47, yes_ask=0.49)
     from dataclasses import replace as dc_replace
     held = dc_replace(
         make_position("M1", "YES", shares=50.0, avg_entry=0.50),
-        current_price=Decimal("0.42"),
+        current_price=Decimal("0.47"),
     )
     tick = make_tick(candidates=[m], positions=[held])
 
-    # Default 20% threshold: -16% loss should NOT fire.
+    # Default 10% threshold (Elite): -6% loss should NOT fire.
     stage_default = make_stage()
     assert stage_default.execute(tick, forecast_result({})).data["intents"] == []
 
-    # Custom 15% threshold: -16% loss SHOULD fire.
+    # Custom 5% threshold: -6% loss SHOULD fire.
     from agent.settings import RiskConfig
     stage_tight = RiskAwareActionStage(
         llm_client=None,
         constraints=TradingConstraints(),
-        risk=RiskConfig(stop_loss_threshold=0.15),
+        risk=RiskConfig(stop_loss_threshold=0.05),
     )
     out = stage_tight.execute(tick, forecast_result({}))
     assert len(out.data["intents"]) == 1

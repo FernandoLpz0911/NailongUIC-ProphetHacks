@@ -182,12 +182,48 @@ class TextReviewStage(ReviewStage):
         candidates: Sequence[CandidateMarket],
         tick_ctx: TickContext,
     ) -> dict:
-        candidates_text = "\n".join(
-            f"{m.market_id} | {m.question[:80]} | "
-            f"{m.yes_bid:.2f}/{m.yes_ask:.2f} | ${m.volume_24h:.0f} "
-            f"[{_category(m.market_id, m.question)}]"
-            for m in candidates
+        # Nailong Elite: shrink the candidate list to the top 60 by volume to
+        # prevent MAX_TOKENS truncation on the review output. The original
+        # behavior sent all ~200 candidates (~30k chars) which truncated
+        # the response to 2-3 markets instead of 10.
+        ranked = sorted(
+            candidates,
+            key=lambda m: (getattr(m, "volume_24h", 0) or 0),
+            reverse=True,
         )
+        top_candidates = ranked[:60]
+
+        # Annotate each candidate with days_to_resolution so the LLM can
+        # prefer short-duration markets (we need >=10 resolutions in 14 days
+        # for win-rate / Sharpe / Brier to populate).
+        import datetime as _dt
+        now = _dt.datetime.now(_dt.timezone.utc)
+
+        def _days_to_res(m: CandidateMarket) -> float | None:
+            close_time = getattr(m, "close_time", None) or getattr(m, "end_date", None)
+            if close_time is None:
+                return None
+            try:
+                if hasattr(close_time, "tzinfo"):
+                    delta = close_time - now
+                else:
+                    delta = _dt.datetime.fromisoformat(str(close_time)).replace(
+                        tzinfo=_dt.timezone.utc
+                    ) - now
+                return max(0.0, delta.total_seconds() / 86400.0)
+            except Exception:
+                return None
+
+        def _fmt(m: CandidateMarket) -> str:
+            days = _days_to_res(m)
+            d_str = f"{days:.0f}d" if days is not None else "?d"
+            return (
+                f"{m.market_id} | {m.question[:80]} | "
+                f"{m.yes_bid:.2f}/{m.yes_ask:.2f} | ${m.volume_24h:.0f} | {d_str} "
+                f"[{_category(m.market_id, m.question)}]"
+            )
+
+        candidates_text = "\n".join(_fmt(m) for m in top_candidates)
 
         positions_text = format_portfolio_summary(tick_ctx, include_positions=True)
         memory_summary = getattr(tick_ctx, "memory_summary", "") or ""
@@ -202,6 +238,8 @@ class TextReviewStage(ReviewStage):
 
         system_prompt = f"""\
 You are a prediction market analyst selecting markets for detailed analysis.
+This is a 14-day evaluation window — we need markets that will RESOLVE within
+that window so we accumulate enough fills for the metrics to populate.
 
 HOW PREDICTION MARKETS WORK:
 - Price = probability (0.50 = 50% chance of YES)
@@ -209,10 +247,17 @@ HOW PREDICTION MARKETS WORK:
 - BUY NO at 0.40: profit if event does NOT happen (you think <40% likely)
 - Spread between bid/ask indicates liquidity
 
-Review ALL {len(candidates)} markets and select up to {self.max_markets} \
-for deeper research.
+Review the {len(top_candidates)} markets below (sorted by 24h volume) and \
+select up to {self.max_markets} for deeper research.
+
+STRONG PREFERENCE — DURATION:
+The last column shows days-to-resolution (e.g. "21d"). STRONGLY prefer markets
+resolving within 30 days. We need actual resolutions to evaluate. Markets
+resolving in 2027+ should make up at most 2 of your selections, and only if
+they have an exceptional edge.
 
 GOOD REASONS TO SELECT:
+- Short-duration market with active trading (your top priority)
 - You have domain knowledge about the topic
 - Recent news/events may not be fully priced in
 - The probability seems off based on base rates or logic
@@ -222,10 +267,13 @@ SKIP markets where:
 - Price is below 0.10 or above 0.90 (near resolution, limited upside)
 - You have no way to research or form a view
 - Question is too vague or ambiguous
+- Days-to-resolution >365 unless you have very high conviction
 
-DIVERSITY RULE: Select at most 2 markets from any single category. \
-Aim for markets from at least 3 different categories. \
-Each market's category is shown in [brackets] after its line.
+DIVERSITY RULE: Select at most 2 markets from any single category and at most
+2 markets from the same underlying event (e.g. don't pick multiple "2028 Dem
+nominee" sub-markets — they are mutually exclusive bets).
+Aim for markets from at least 3 different categories. Each market's category
+is shown in [brackets] after its line.
 
 OUTPUT RULES — read carefully:
 - Output ONLY a JSON object. No prose, no markdown fences, no function calls.
@@ -246,10 +294,11 @@ OUTPUT RULES — read carefully:
             f"Current tick: {tick_ctx.tick_ts}\n"
             f"Cash available: ${float(tick_ctx.cash):,.0f}\n"
             f"{positions_text}\n"
-            f"All {len(candidates)} candidate markets "
-            f"(ID | Question | Bid/Ask | 24h Volume):\n"
+            f"Top {len(top_candidates)} candidate markets by volume "
+            f"(ID | Question | Bid/Ask | 24h Volume | Days-to-Resolution | Category):\n"
             f"{candidates_text}\n\n"
-            f"Select up to {self.max_markets} markets worth researching."
+            f"Select up to {self.max_markets} markets, prioritizing short-duration "
+            f"high-volume opportunities."
             f"{memory_block}"
         )
 
@@ -258,8 +307,10 @@ OUTPUT RULES — read carefully:
             LLMMessage(role="user", content=user_prompt),
         ]
 
+        # Bumped from 8192 to 16384 — live logs showed MAX_TOKENS truncation
+        # at 325 output tokens, getting only 2-3 markets instead of 10.
         response = self.llm_client.generate(
-            LLMRequest(messages=messages, max_tokens=8192)
+            LLMRequest(messages=messages, max_tokens=16384)
         )
         text = response.content or ""
 

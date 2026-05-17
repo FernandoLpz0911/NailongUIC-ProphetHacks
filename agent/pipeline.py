@@ -25,6 +25,7 @@ from ai_prophet.trade.core.credentials import Credentials, normalize_provider_na
 from ai_prophet.trade.llm import create_llm_client
 from ai_prophet_core.client import ServerAPIClient
 
+from agent.llm_wrapper import CostTrackingLLMClient
 from agent.settings import RuntimeConfig, load as load_runtime
 from agent.stages.calibrated_forecast import CalibratedForecastStage
 from agent.stages.retrieval_search import RetrievalSearchClient
@@ -74,12 +75,17 @@ def build_custom_pipeline(
             f"Set {llm_provider.upper()}_API_KEY in .env."
         )
 
-    llm_client = create_llm_client(
+    raw_llm_client = create_llm_client(
         provider=llm_provider,
         model=model_name,
         api_key=api_key,
         verbose=verbose,
         config=client_config.llm,
+    )
+    # Wrap with cost tracking — every call recorded to spend ledger,
+    # so the kill switch in agent.spend.is_killed() becomes active.
+    llm_client = CostTrackingLLMClient(
+        raw_llm_client, provider=llm_provider, stage=None,
     )
 
     api_client = ServerAPIClient(
@@ -123,7 +129,9 @@ def build_custom_pipeline(
         llm_client=None,  # deterministic; no second LLM call
         constraints=runtime.constraints,
         risk=runtime.risk,
+        calibration=runtime.calibration,
         min_size_usd=runtime.risk.min_intent_size_usd,
+        target_total_ticks=runtime.target_total_ticks,
     )
 
     logger.info(
