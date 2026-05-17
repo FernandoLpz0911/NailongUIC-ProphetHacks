@@ -256,7 +256,7 @@ class RiskAwareActionStage(ActionStage):
           - Otherwise (tests / base SDK): gate on blended edge >= min_edge.
         Sizing uses the blended edge in both cases (conservative Kelly input).
         """
-        p_yes = _clamp01(p_yes)
+        p_yes = 1.0 - _clamp01(p_yes)  # INVERT: take the opposite side of every forecast
         p_no = 1.0 - p_yes
 
         yes_ask = float(market.yes_ask)
