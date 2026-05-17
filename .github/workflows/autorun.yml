@@ -1,0 +1,52 @@
+name: Nailong Autorun
+
+on:
+  push:
+  workflow_dispatch:
+
+# Each run gets its own slug so concurrent builds never fight over a tick lease.
+# cancel-in-progress: false — never cancel a running experiment mid-tick.
+concurrency:
+  group: nailong-${{ github.run_number }}
+  cancel-in-progress: false
+
+jobs:
+  run-agent:
+    name: "nailong_${{ github.run_number }} (26 ticks)"
+    runs-on: ubuntu-latest
+
+    # 26 ticks × 15 min + ~15 min first-tick wait + buffer = ~420 min.
+    # Note: GitHub free tier caps jobs at 360 min; a paid plan is recommended.
+    timeout-minutes: 420
+
+    env:
+      PA_SERVER_URL: https://api.aiprophet.dev
+      PA_SERVER_API_KEY: ${{ secrets.PA_SERVER_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      TAVILY_API_KEY: ${{ secrets.TAVILY_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+      KILL_SWITCH_USD: "100"
+      LOG_LEVEL: INFO
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements.txt
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run agent
+        run: |
+          python -m agent.run \
+            --slug "nailong_${{ github.run_number }}" \
+            --max-ticks 26 \
+            --publish-reasoning
