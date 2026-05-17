@@ -130,6 +130,9 @@ class RiskConfig:
     max_position_pct_of_equity: float = field(
         default_factory=lambda: _env_float("MAX_POSITION_PCT_OF_EQUITY", 0.05)
     )
+    target_portfolio_var: float = field(
+        default_factory=lambda: _env_float("TARGET_PORTFOLIO_VAR", 0.10)
+    )
     min_intent_size_usd: float = field(default_factory=lambda: _env_float("MIN_INTENT_SIZE_USD", 5.0))
     trade_floor_count: int = field(default_factory=lambda: _env_int("TRADE_FLOOR_COUNT", 14))
     take_profit_threshold: float = field(

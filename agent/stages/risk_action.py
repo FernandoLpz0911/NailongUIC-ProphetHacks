@@ -315,22 +315,57 @@ class RiskAwareActionStage(ActionStage):
                 }
 
         # ------------------------------------------------------------------
-        # Standard BUY path.
+        # AGGRESSIVE BUY PATH (Reduced Volatility Penalization)
         # ------------------------------------------------------------------
         if best_price <= 0 or best_price >= 1.0:
             return None  # Degenerate or resolved-near-expiry market.
 
-        # Exact binary Kelly: f* = edge / (1 - price), scaled by kelly_fraction.
-        # Epistemic shrinkage (James-Stein): reduce when LLM ensemble shows high
-        # variance, since σ²_position = p(1-p) + Var(LLM_samples).
+        # Epistemic shrinkage (James-Stein): reduce when LLM ensemble shows high variance
         from agent.calibration import epistemic_shrink
         shrink = epistemic_shrink(p_yes, llm_var)
+
+        # 1. Base Exact Kelly: f* = edge / (1 - price)
+        base_kelly = best_edge / max(1.0 - best_price, 1e-6)
+
+        # 2. Aggressive Volatility Penalization
+        asset_var = best_price * (1.0 - best_price)
+        asset_std_dev = max(asset_var ** 0.5, 1e-6)
+        base_dampener = min(1.0, 0.4 / asset_std_dev)
+
+        # --- AGGRESSIVE TUNING ---
+        # Begin releasing brakes at just a 2% edge (0.02) instead of 8%.
+        # Multiply by 10.0 so it reaches full Kelly sizing much faster.
+        if best_edge > 0.02:
+            recovery_factor = min(1.0, (best_edge - 0.02) * 10.0)
+            sharpe_dampener = base_dampener + ((1.0 - base_dampener) * recovery_factor)
+        else:
+            sharpe_dampener = base_dampener
+
+        # B. Relaxed Portfolio-Level Penalty
+        # Calculate current portfolio variance from existing positions
+        current_port_var = 0.0
+        for pos in tick_ctx.positions:
+            p_outcome = 0.5  # Conservative assumption: 50/50 on any position
+            position_var = p_outcome * (1.0 - p_outcome)
+            current_port_var += position_var
+
+        # Double the target portfolio variance tolerance (0.10 instead of default 0.05)
+        # Set a higher floor (0.4 instead of 0.1) so the agent keeps trading even when loaded
+        target_max_var = getattr(self.risk, 'target_portfolio_var', 0.10)
+        heat_penalty = max(0.4, 1.0 - (current_port_var / max(target_max_var, 1e-6)))
+
+        # C. Calculate Adjusted Size
         kelly_frac = (
             self.risk.kelly_fraction
             * shrink
-            * (best_edge / max(1.0 - best_price, 1e-6))
+            * base_kelly
+            * sharpe_dampener
+            * heat_penalty
         )
-        kelly_frac = max(0.0, min(self.risk.max_position_pct_of_equity, kelly_frac))
+
+        # Allow positions to be up to 2x larger than the original soft cap
+        max_pct = self.risk.max_position_pct_of_equity * 2.0
+        kelly_frac = max(0.0, min(max_pct, kelly_frac))
 
         equity = float(tick_ctx.equity)
         size_usd = kelly_frac * equity
@@ -355,7 +390,7 @@ class RiskAwareActionStage(ActionStage):
             "shares":            shares,
             "rationale": (
                 f"edge={best_edge:+.3f} (p_yes={p_yes:.3f}, price={best_price:.3f}); "
-                f"half-Kelly size ${size_usd:.0f} = {kelly_frac:.2%} of ${equity:.0f}. "
+                f"aggressive-Kelly size ${size_usd:.0f} = {kelly_frac:.2%} of ${equity:.0f}. "
                 f"{rationale}"
             ).strip(),
             "p_yes":             p_yes,
