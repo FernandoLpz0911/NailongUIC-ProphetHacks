@@ -175,7 +175,11 @@ def test_retrieve_rejects_kalshi_source_flag():
     )
 
     assert result.exit_code != 0
-    assert "No such option: --source" in result.output
+    # Click changed its error format around 8.1.0 from "No such option: --foo"
+    # to "No such option '--foo'.".  Accept both so the test isn't pinned to a
+    # specific Click version (CI uses whatever pip resolves at install time).
+    assert "No such option" in result.output
+    assert "--source" in result.output
 
 
 def test_forecast_submit_command_is_not_available():
