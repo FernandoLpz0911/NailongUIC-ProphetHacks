@@ -74,6 +74,13 @@ def _env_int(key: str, default: int) -> int:
         return default
 
 
+def _env_bool(key: str, default: bool) -> bool:
+    v = os.getenv(key)
+    if v is None or v == "":
+        return default
+    return v.strip().lower() in ("1", "true", "yes", "on", "y", "t")
+
+
 @dataclass(frozen=True)
 class TradingConstraints:
     """Hard caps the Core API enforces; mirrored locally to fail fast."""
@@ -162,6 +169,21 @@ class RiskConfig:
     )
     far_term_size_floor: float = field(
         default_factory=lambda: _env_float("FAR_TERM_SIZE_FLOOR", 0.30)
+    )
+    # Contrarian inversion: when True, every BUY intent is flipped to the
+    # opposite side (BUY YES becomes BUY NO and vice versa). All upstream
+    # decision math (edge gate, raw-gap gate, Kelly sizing) still runs on
+    # the original best-edge side — we only swap the side, price, and
+    # share-count of the emitted intent. The flip-as-sell rule adapts so
+    # held positions opposite the inverted side are closed correctly.
+    invert_strategy: bool = field(
+        default_factory=lambda: _env_bool("INVERT_STRATEGY", False)
+    )
+    # Forecast-driven flip-as-sell may not fire on a position younger than
+    # this many ticks. Take-profit and stop-loss exits are unaffected.
+    # Default 0 keeps existing behavior; tune up in `.env` to dampen churn.
+    min_dwell_ticks: int = field(
+        default_factory=lambda: _env_int("POSITION_MIN_DWELL_TICKS", 0)
     )
 
 

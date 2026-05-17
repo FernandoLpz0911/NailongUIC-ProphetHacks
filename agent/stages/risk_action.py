@@ -43,6 +43,52 @@ from agent.stages.text_review import _category
 
 logger = logging.getLogger(__name__)
 
+# Process-level position-age ledger. Keyed by (market_id, side) → the tick_ts
+# we first observed that position in our portfolio. Used by the dwell-time
+# guard to suppress flip-as-sell on positions that are still "young."
+#
+# Limitations:
+#   * Persists in-process only — a bot restart resets ages to "just opened".
+#   * Cleared between unit tests via the autouse fixture in test_risk_action.py.
+_POSITION_FIRST_SEEN: dict[tuple[str, str], datetime] = {}
+
+
+def _update_position_ages(
+    positions: tuple, tick_ts: datetime
+) -> None:
+    """Stamp first-seen tick_ts for newly-observed positions; prune closed ones."""
+    if tick_ts.tzinfo is None:
+        tick_ts = tick_ts.replace(tzinfo=timezone.utc)
+    current_keys = {(p.market_id, p.side) for p in positions}
+    for key in list(_POSITION_FIRST_SEEN.keys()):
+        if key not in current_keys:
+            del _POSITION_FIRST_SEEN[key]
+    for p in positions:
+        key = (p.market_id, p.side)
+        if key not in _POSITION_FIRST_SEEN:
+            _POSITION_FIRST_SEEN[key] = tick_ts
+
+
+def _position_age_ticks(
+    market_id: str, side: str, tick_ts: datetime, tick_interval_seconds: int,
+) -> int | None:
+    """Whole-ticks elapsed since the position was first observed in our portfolio.
+
+    Returns None when the position is unknown to the ledger (caller treats this
+    as "age unknown" — by convention we let the trade proceed rather than block
+    on a missing record).
+    """
+    first_seen = _POSITION_FIRST_SEEN.get((market_id, side))
+    if first_seen is None:
+        return None
+    if tick_ts.tzinfo is None:
+        tick_ts = tick_ts.replace(tzinfo=timezone.utc)
+    if first_seen.tzinfo is None:
+        first_seen = first_seen.replace(tzinfo=timezone.utc)
+    delta = (tick_ts - first_seen).total_seconds()
+    interval = max(int(tick_interval_seconds), 1)
+    return int(delta // interval)
+
 
 class RiskAwareActionStage(ActionStage):
     """Replaces the SDK ActionStage with a deterministic, rule-bound sizer."""
@@ -84,6 +130,12 @@ class RiskAwareActionStage(ActionStage):
         forecasts: dict[str, dict[str, Any]] = (
             previous_results["forecast"].data.get("forecasts", {}) or {}
         )
+        # Refresh the position-age ledger BEFORE any scoring so the dwell
+        # guard sees first_seen for each held position. A brand-new position
+        # observed this tick gets age=0, which the guard treats as "too young
+        # to flip" when min_dwell_ticks > 0.
+        _update_position_ages(tick_ctx.positions, tick_ctx.tick_ts)
+
         # Decide effective min_edge for this tick.
         min_edge = self._effective_min_edge(tick_ctx)
         equity = float(tick_ctx.equity)
@@ -353,13 +405,44 @@ class RiskAwareActionStage(ActionStage):
             if best_edge < min_edge:
                 return None
 
+        # Contrarian inversion: every gate above used the higher-edge side as
+        # our conviction filter. From here on, `final_side` is what the intent
+        # actually buys. When invert_strategy is on, that's the opposite side
+        # at the opposite ask. Sizing math below still uses best_edge /
+        # best_price (the original conviction), so we only trade when there
+        # would have been real edge — we just execute against it.
+        if self.risk.invert_strategy:
+            final_side = "NO" if best_side == "YES" else "YES"
+            final_buy_price = no_ask if final_side == "NO" else yes_ask
+        else:
+            final_side = best_side
+            final_buy_price = best_price
+
         existing = tick_ctx.get_position(market_id)
 
         # ------------------------------------------------------------------
         # Position-flip-as-sell rule: never BUY opposite side of an existing
         # position. Emit SELL on the held side to reduce/close instead.
+        # Compared against `final_side` (the side we'd actually buy) so that
+        # the rule is coherent under inversion.
         # ------------------------------------------------------------------
-        if existing is not None and existing.side != best_side:
+        if existing is not None and existing.side != final_side:
+            # Dwell-time guard: don't flip a position that's still "young".
+            # Damps high-frequency churn from noisy forecast oscillations.
+            # Mechanical exits (TP/SL) are emitted from a separate path and
+            # are NOT subject to this guard — they always fire when triggered.
+            if self.risk.min_dwell_ticks > 0:
+                age = _position_age_ticks(
+                    market_id, existing.side, tick_ctx.tick_ts,
+                    self.constraints.tick_interval_seconds,
+                )
+                if age is not None and age < self.risk.min_dwell_ticks:
+                    logger.debug(
+                        "Action: skip flip on %s, position age %d ticks < min %d",
+                        market_id, age, self.risk.min_dwell_ticks,
+                    )
+                    return None
+
             shares_held = float(existing.shares)
             if shares_held <= 0:
                 # Shouldn't happen but be defensive.
@@ -374,6 +457,7 @@ class RiskAwareActionStage(ActionStage):
                 if sell_price <= 0:
                     return None
                 sell_notional = shares_held * sell_price
+                inv_tag = "[INVERTED] " if self.risk.invert_strategy else ""
                 return {
                     "market_id":        market_id,
                     "action":           "SELL",
@@ -383,8 +467,8 @@ class RiskAwareActionStage(ActionStage):
                     "size_usd":         sell_notional,
                     "shares":           shares_held,
                     "rationale": (
-                        f"Flip-as-sell: held {held_side} {shares_held:.2f} shares; "
-                        f"forecast prefers {best_side} (edge {best_edge:+.3f}). "
+                        f"{inv_tag}Flip-as-sell: held {held_side} {shares_held:.2f} shares; "
+                        f"strategy prefers {final_side} (best-edge side {best_side}, edge {best_edge:+.3f}). "
                         f"Selling to flat, will re-enter next tick. {rationale}"
                     ).strip(),
                     "p_yes":             p_yes,
@@ -407,11 +491,15 @@ class RiskAwareActionStage(ActionStage):
 
         if best_price <= 0 or best_price >= 1.0:
             return None  # Degenerate or resolved-near-expiry market.
+        if final_buy_price <= 0 or final_buy_price >= 1.0:
+            return None  # Opposite side is degenerate (only possible under inversion).
 
         # Spread gate: wide spreads eat edge at entry. Exempt from flip-as-sell.
+        # Always check the side we're actually buying (`final_side`), not the
+        # conviction side, so the gate is honest about execution cost.
         yes_bid = float(market.yes_bid)
         no_bid = float(market.no_bid)
-        if best_side == "YES":
+        if final_side == "YES":
             spread_mid = (yes_ask + yes_bid) / 2.0
             spread_pct = (yes_ask - yes_bid) / spread_mid if spread_mid > 0 else 1.0
         else:
@@ -478,20 +566,29 @@ class RiskAwareActionStage(ActionStage):
         if size_usd < self.min_size_usd:
             return None
 
-        shares = self._size_to_shares(size_usd, best_price)
+        # Compute shares against the price we'll actually pay (final_buy_price),
+        # so notional ≈ size_usd regardless of whether we inverted the side.
+        shares = self._size_to_shares(size_usd, final_buy_price)
         if shares <= 0:
             return None
+
+        inv_tag = "[INVERTED] " if self.risk.invert_strategy else ""
+        inv_note = (
+            f" (flipped from BUY-{best_side}@{best_price:.3f})"
+            if self.risk.invert_strategy else ""
+        )
 
         return {
             "market_id":         market_id,
             "action":            "BUY",
-            "side":              best_side,
-            "price":             best_price,
+            "side":              final_side,
+            "price":             final_buy_price,
             "edge":              best_edge,
             "size_usd":          size_usd,
             "shares":            shares,
             "rationale": (
-                f"edge={best_edge:+.3f} (p_yes={p_yes:.3f}, price={best_price:.3f}); "
+                f"{inv_tag}edge={best_edge:+.3f} (p_yes={p_yes:.3f}, "
+                f"conviction-price={best_price:.3f}, exec-price={final_buy_price:.3f}{inv_note}); "
                 f"adj-Kelly size ${size_usd:.0f} (heat_pen={heat_penalty:.2f}, "
                 f"sharpe_pen={sharpe_dampener:.2f}, time_mult={time_mult:.2f}"
                 f"{f', days_to_res={days_to_res:.1f}' if days_to_res is not None else ''})."

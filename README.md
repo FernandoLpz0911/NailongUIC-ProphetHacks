@@ -131,6 +131,8 @@ Override any `RuntimeConfig` field by setting the matching env var (see
 | `MAX_DAYS_TO_RESOLUTION` | `21` | Hard skip on new BUYs for markets resolving more than this many days out |
 | `NEAR_TERM_HORIZON_DAYS` | `7` | Within this many days of resolution → full Kelly size; mid-horizon tapers down |
 | `FAR_TERM_SIZE_FLOOR` | `0.30` | Sizing multiplier just inside the max-days boundary (linear taper anchor) |
+| `INVERT_STRATEGY` | `false` | Contrarian mode: flip every BUY to the opposite side (BUY YES → BUY NO and vice versa). All edge/raw-gap gates and sizing still run on the original conviction side; only the executed side, price, and shares are flipped. Flip-as-sell adapts to the inverted side. |
+| `POSITION_MIN_DWELL_TICKS` | `0` | Min ticks a position must be held before forecast-driven flip-as-sell may fire. Take-profit and stop-loss are NOT gated. Raise this (e.g. `4` ≈ 1h at the 15-min cadence) to dampen churn from noisy forecast oscillations. |
 | `KILL_SWITCH_USD` | `180` | Cumulative spend at which forecasts fall back to market mid |
 
 ---

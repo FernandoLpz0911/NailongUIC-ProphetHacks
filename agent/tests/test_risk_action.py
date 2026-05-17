@@ -30,6 +30,32 @@ def _clear_forecast_extras():
     yield
     TICK_FORECAST_EXTRAS.clear()
 
+
+@pytest.fixture(autouse=True)
+def _isolate_env_overrides(monkeypatch):
+    """Strip live .env overrides that would change RiskConfig defaults under
+    tests. Existing tests assert the **code-default** RiskConfig values;
+    live `.env` may tune them up. Tests that exercise non-default behavior
+    construct RiskConfig(...) with explicit kwargs.
+    """
+    for key in (
+        "INVERT_STRATEGY",
+        "MIN_EDGE",
+        "MIN_EDGE_RELAXED",
+        "MIN_RAW_GAP",
+        "POSITION_MIN_DWELL_TICKS",
+    ):
+        monkeypatch.delenv(key, raising=False)
+
+
+@pytest.fixture(autouse=True)
+def _reset_position_age_ledger():
+    """Reset the process-level position-age ledger between tests."""
+    from agent.stages.risk_action import _POSITION_FIRST_SEEN
+    _POSITION_FIRST_SEEN.clear()
+    yield
+    _POSITION_FIRST_SEEN.clear()
+
 def _tick_boundary(minutes: int = 15) -> datetime:
     """Snap to a 15-min boundary (the SDK enforces this in TickContext.__post_init__)."""
     now = datetime.now(timezone.utc).replace(second=0, microsecond=0)
@@ -841,3 +867,253 @@ def test_horizon_gate_does_not_block_flip_as_sell():
     assert len(out.data["intents"]) == 1
     assert out.data["intents"][0]["action"] == "SELL"
     assert out.data["intents"][0]["side"] == "YES"
+
+
+# ---------------------------------------------------------------------------
+# Contrarian inversion (invert_strategy=True)
+# ---------------------------------------------------------------------------
+
+def test_invert_flips_buy_yes_to_buy_no():
+    # Same setup as test_buy_yes_when_edge_clears_threshold but inverted:
+    # ask 0.40, p_yes 0.60 -> normally BUY YES, inverted should BUY NO.
+    m = make_market("M1", yes_bid=0.36, yes_ask=0.40)
+    tick = make_tick(candidates=[m])
+    stage = make_stage(invert_strategy=True)
+
+    out = stage.execute(tick, forecast_result({"M1": {"p_yes": 0.60, "rationale": "real edge"}}))
+
+    intents = out.data["intents"]
+    assert len(intents) == 1
+    assert intents[0]["action"] == "BUY"
+    assert intents[0]["side"] == "NO"
+    assert "INVERTED" in intents[0]["rationale"]
+
+
+def test_invert_flips_buy_no_to_buy_yes():
+    # Same setup as test_buy_no_when_negative_yes_edge_but_positive_no_edge,
+    # inverted should BUY YES instead of BUY NO.
+    m = make_market("M1", yes_bid=0.78, yes_ask=0.80)
+    tick = make_tick(candidates=[m])
+    stage = make_stage(invert_strategy=True)
+
+    out = stage.execute(tick, forecast_result({"M1": {"p_yes": 0.30, "rationale": "no-side edge"}}))
+
+    intents = out.data["intents"]
+    assert len(intents) == 1
+    assert intents[0]["action"] == "BUY"
+    assert intents[0]["side"] == "YES"
+
+
+def test_invert_preserves_edge_gate():
+    # ask 0.52, p_yes 0.54 -> edge 0.02 < default 0.05.
+    # Inversion only swaps SIDES after gates pass; weak-edge trades are still
+    # filtered out (we don't want to bet against meaningless 1% gaps).
+    m = make_market("M1", yes_bid=0.48, yes_ask=0.52)
+    tick = make_tick(candidates=[m])
+    stage = make_stage(invert_strategy=True)
+
+    out = stage.execute(tick, forecast_result({"M1": {"p_yes": 0.54, "rationale": ""}}))
+    assert out.data["intents"] == []
+
+
+def test_invert_uses_opposite_price_for_shares():
+    # YES price 0.40 has plenty of edge; inverted intent buys NO at 0.60.
+    # Notional should be roughly equal under both modes (same Kelly size_usd),
+    # but shares should differ because NO price > YES price.
+    m = make_market("M1", yes_bid=0.36, yes_ask=0.40)
+    tick = make_tick(candidates=[m])
+    forecasts = {"M1": {"p_yes": 0.60, "rationale": ""}}
+
+    out_normal = make_stage(invert_strategy=False).execute(tick, forecast_result(forecasts))
+    out_invert = make_stage(invert_strategy=True).execute(tick, forecast_result(forecasts))
+
+    assert len(out_normal.data["intents"]) == 1
+    assert len(out_invert.data["intents"]) == 1
+    n_intent = out_normal.data["intents"][0]
+    i_intent = out_invert.data["intents"][0]
+
+    # Same notional (sizing math is identical), different shares (different price).
+    n_size = out_normal.data["decisions"]["M1"]["size_usd"]
+    i_size = out_invert.data["decisions"]["M1"]["size_usd"]
+    assert n_size == pytest.approx(i_size, abs=1.0)
+    assert float(n_intent["shares"]) > float(i_intent["shares"])  # 1/0.40 > 1/0.60
+
+
+def test_invert_flip_as_sell_aligns_with_inverted_side():
+    # Hold YES. Forecast prefers YES (best_side=YES, +edge). Under inversion
+    # the final emitted side would be NO -> existing YES != NO -> flip-as-sell
+    # should fire and SELL the held YES even though forecast still likes YES.
+    m = make_market("M1", yes_bid=0.36, yes_ask=0.40)
+    held = make_position("M1", "YES", shares=20.0, avg_entry=0.30)
+    tick = make_tick(candidates=[m], positions=[held])
+
+    stage = make_stage(invert_strategy=True)
+    out = stage.execute(tick, forecast_result({"M1": {"p_yes": 0.60, "rationale": ""}}))
+
+    intents = out.data["intents"]
+    assert len(intents) == 1
+    assert intents[0]["action"] == "SELL"
+    assert intents[0]["side"] == "YES"
+    assert "INVERTED" in intents[0]["rationale"]
+
+
+def test_invert_no_flip_as_sell_when_held_matches_inverted_side():
+    # Hold NO. Forecast prefers YES (best_side=YES). Under inversion final
+    # side is NO, which matches the held side -> no flip-as-sell, standard
+    # BUY NO instead (add to position).
+    m = make_market("M1", yes_bid=0.36, yes_ask=0.40)
+    held = make_position("M1", "NO", shares=20.0, avg_entry=0.55)
+    tick = make_tick(candidates=[m], positions=[held])
+
+    stage = make_stage(invert_strategy=True)
+    out = stage.execute(tick, forecast_result({"M1": {"p_yes": 0.60, "rationale": ""}}))
+
+    intents = out.data["intents"]
+    assert len(intents) == 1
+    assert intents[0]["action"] == "BUY"
+    assert intents[0]["side"] == "NO"
+
+
+# ---------------------------------------------------------------------------
+# Position dwell-time guard
+# ---------------------------------------------------------------------------
+
+def _seed_position_age(market_id: str, side: str, *, age_ticks: int, tick_interval_s: int = 900):
+    """Pre-populate _POSITION_FIRST_SEEN so a position appears `age_ticks` old."""
+    from agent.stages.risk_action import _POSITION_FIRST_SEEN
+    now = _tick_boundary()
+    first_seen = now - timedelta(seconds=age_ticks * tick_interval_s)
+    _POSITION_FIRST_SEEN[(market_id, side)] = first_seen
+
+
+def test_dwell_guard_blocks_flip_on_young_position():
+    # We hold YES; forecast now prefers NO. With min_dwell_ticks=4 and a
+    # freshly-observed position (age=0 after _update_position_ages runs),
+    # flip-as-sell should be suppressed.
+    m = make_market("M1", yes_bid=0.78, yes_ask=0.80)
+    held = make_position("M1", "YES", shares=50.0, avg_entry=0.50)
+    tick = make_tick(candidates=[m], positions=[held])
+
+    stage = make_stage(min_dwell_ticks=4)
+    out = stage.execute(tick, forecast_result({"M1": {"p_yes": 0.20, "rationale": "flip"}}))
+    assert out.data["intents"] == []
+
+
+def test_dwell_guard_allows_flip_after_min_ticks_elapsed():
+    # Same setup, but pre-seed the position's first_seen to 5 ticks ago,
+    # so age >= min_dwell_ticks=4 and flip-as-sell proceeds.
+    m = make_market("M1", yes_bid=0.78, yes_ask=0.80)
+    held = make_position("M1", "YES", shares=50.0, avg_entry=0.50)
+    tick = make_tick(candidates=[m], positions=[held])
+
+    _seed_position_age("M1", "YES", age_ticks=5)
+    stage = make_stage(min_dwell_ticks=4)
+    out = stage.execute(tick, forecast_result({"M1": {"p_yes": 0.20, "rationale": "flip"}}))
+    assert len(out.data["intents"]) == 1
+    assert out.data["intents"][0]["action"] == "SELL"
+    assert out.data["intents"][0]["side"] == "YES"
+
+
+def test_dwell_guard_disabled_when_zero():
+    # min_dwell_ticks=0 (default) is a no-op: even a freshly-observed position
+    # flips immediately when forecast direction changes.
+    m = make_market("M1", yes_bid=0.78, yes_ask=0.80)
+    held = make_position("M1", "YES", shares=50.0, avg_entry=0.50)
+    tick = make_tick(candidates=[m], positions=[held])
+
+    stage = make_stage()  # min_dwell_ticks defaults to 0
+    out = stage.execute(tick, forecast_result({"M1": {"p_yes": 0.20, "rationale": "flip"}}))
+    assert len(out.data["intents"]) == 1
+    assert out.data["intents"][0]["action"] == "SELL"
+
+
+def test_dwell_guard_does_not_block_take_profit_on_young_position():
+    # Take-profit is a mechanical exit; the dwell guard must NOT gate it.
+    m = make_market("M1", yes_bid=0.75, yes_ask=0.78)
+    from dataclasses import replace as dc_replace
+    held = dc_replace(
+        make_position("M1", "YES", shares=100.0, avg_entry=0.50),
+        current_price=Decimal("0.75"),
+    )
+    tick = make_tick(candidates=[m], positions=[held])
+
+    stage = make_stage(min_dwell_ticks=4)
+    out = stage.execute(tick, forecast_result({}))
+    assert len(out.data["intents"]) == 1
+    assert out.data["intents"][0]["action"] == "SELL"
+    assert "Take-profit" in out.data["intents"][0]["rationale"]
+
+
+def test_dwell_guard_does_not_block_stop_loss_on_young_position():
+    # Stop-loss is also a mechanical exit; dwell guard must NOT gate it.
+    m = make_market("M1", yes_bid=0.35, yes_ask=0.38)
+    from dataclasses import replace as dc_replace
+    held = dc_replace(
+        make_position("M1", "YES", shares=100.0, avg_entry=0.50),
+        current_price=Decimal("0.35"),
+    )
+    tick = make_tick(candidates=[m], positions=[held])
+
+    stage = make_stage(min_dwell_ticks=4)
+    out = stage.execute(tick, forecast_result({}))
+    assert len(out.data["intents"]) == 1
+    assert out.data["intents"][0]["action"] == "SELL"
+    assert "Stop-loss" in out.data["intents"][0]["rationale"]
+
+
+def test_dwell_guard_does_not_block_adding_to_same_side():
+    # Hold YES; forecast still prefers YES. This is not a flip — it's an
+    # add-to-position. Dwell guard must NOT block it.
+    m = make_market("M1", yes_bid=0.36, yes_ask=0.40)
+    held = make_position("M1", "YES", shares=20.0, avg_entry=0.30)
+    tick = make_tick(candidates=[m], positions=[held])
+
+    stage = make_stage(min_dwell_ticks=4)
+    out = stage.execute(tick, forecast_result({"M1": {"p_yes": 0.60, "rationale": ""}}))
+    assert len(out.data["intents"]) == 1
+    assert out.data["intents"][0]["action"] == "BUY"
+    assert out.data["intents"][0]["side"] == "YES"
+
+
+def test_position_age_ledger_prunes_closed_positions():
+    # Open a YES on tick 1, then close it (no positions on tick 2). The ledger
+    # entry should be pruned so a re-opened position later starts fresh at age 0.
+    from agent.stages.risk_action import _POSITION_FIRST_SEEN
+
+    m = make_market("M1", yes_bid=0.36, yes_ask=0.40)
+    held = make_position("M1", "YES", shares=20.0, avg_entry=0.30)
+    tick_with_pos = make_tick(candidates=[m], positions=[held])
+
+    stage = make_stage(min_dwell_ticks=4)
+    stage.execute(tick_with_pos, forecast_result({}))
+    assert ("M1", "YES") in _POSITION_FIRST_SEEN
+
+    # Next tick: position is gone from portfolio.
+    tick_empty = make_tick(candidates=[m], positions=[])
+    stage.execute(tick_empty, forecast_result({}))
+    assert ("M1", "YES") not in _POSITION_FIRST_SEEN
+
+
+def test_invert_does_not_affect_take_profit_or_stop_loss():
+    # Mechanical exits are based on entry vs mark, not forecast direction.
+    # Inversion is a directional flip — it must not change exit behavior.
+    tp_market = make_market("TP", yes_bid=0.75, yes_ask=0.78)
+    sl_market = make_market("SL", yes_bid=0.35, yes_ask=0.38)
+    from dataclasses import replace as dc_replace
+    tp_pos = dc_replace(
+        make_position("TP", "YES", shares=100.0, avg_entry=0.50),
+        current_price=Decimal("0.75"),
+    )
+    sl_pos = dc_replace(
+        make_position("SL", "YES", shares=80.0, avg_entry=0.50),
+        current_price=Decimal("0.35"),
+    )
+    tick = make_tick(candidates=[tp_market, sl_market], positions=[tp_pos, sl_pos])
+
+    stage = make_stage(invert_strategy=True)
+    out = stage.execute(tick, forecast_result({}))
+
+    # Both mechanical SELLs on the held side (YES), unchanged by inversion.
+    assert len(out.data["intents"]) == 2
+    sides = {(i["market_id"], i["side"]) for i in out.data["intents"]}
+    assert sides == {("TP", "YES"), ("SL", "YES")}
