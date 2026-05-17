@@ -1,0 +1,249 @@
+"""TextReviewStage: ReviewStage that requests plain-text JSON output.
+
+Gemini consistently generates Python-style function calls
+(print(default_api.submit_review(...))) instead of proper JSON tool responses,
+causing MALFORMED_FUNCTION_CALL with a truncated finishMessage — only the first
+market survives the salvage path. By asking for JSON in the message body with
+no tool binding, we get the full list every tick.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import re
+from collections.abc import Sequence
+
+from ai_prophet.trade.agent.stages.review import ReviewStage
+from ai_prophet.trade.agent.utils import format_portfolio_summary
+from ai_prophet.trade.core import TickContext
+from ai_prophet.trade.core.tick_context import CandidateMarket
+from ai_prophet.trade.llm import LLMMessage
+from ai_prophet.trade.llm.base import LLMRequest
+
+logger = logging.getLogger(__name__)
+
+_FENCE_RE = re.compile(r"```(?:json)?\s*([\s\S]*?)\s*```")
+_TRAILING_COMMA_RE = re.compile(r",\s*([}\]])")
+
+
+def _clean(text: str) -> str:
+    """Strip markdown fences and trailing commas."""
+    fence = _FENCE_RE.search(text)
+    if fence:
+        text = fence.group(1)
+    return _TRAILING_COMMA_RE.sub(r"\1", text.strip())
+
+
+def _extract_objects(s: str) -> list[dict]:
+    """Pull every complete top-level JSON object out of a possibly-truncated string."""
+    objects: list[dict] = []
+    i = 0
+    while i < len(s):
+        if s[i] != "{":
+            i += 1
+            continue
+        depth, in_str, escaped, closed_at = 0, False, False, -1
+        j = i
+        while j < len(s):
+            c = s[j]
+            if escaped:
+                escaped = False
+            elif c == "\\" and in_str:
+                escaped = True
+            elif c == '"':
+                in_str = not in_str
+            elif not in_str:
+                if c == "{":
+                    depth += 1
+                elif c == "}":
+                    depth -= 1
+                    if depth == 0:
+                        closed_at = j
+                        break
+            j += 1
+        if closed_at == -1:
+            break
+        try:
+            obj = json.loads(_TRAILING_COMMA_RE.sub(r"\1", s[i:closed_at + 1]))
+            if isinstance(obj, dict):
+                objects.append(obj)
+        except json.JSONDecodeError:
+            pass
+        i = closed_at + 1
+    return objects
+
+
+def _parse_review_json(text: str) -> dict | None:
+    """Extract and parse the review JSON from a free-text model response.
+
+    Tries four strategies in order:
+    1. Full parse — fast path, works when output is complete.
+    2. Outermost { } block — handles leading/trailing prose.
+    3. Object-by-object from top level — mild truncation / trailing commas.
+    4. Extract entries from inside the review array — severe truncation where
+       the outer { } is never closed (typical MAX_TOKENS mid-entry cutoff).
+    """
+    cleaned = _clean(text)
+
+    # 1. Full parse — must be a dict.
+    try:
+        parsed = json.loads(cleaned)
+        if isinstance(parsed, dict):
+            return parsed
+    except json.JSONDecodeError:
+        pass
+
+    # 2. Outermost { } block.
+    start, end = cleaned.find("{"), cleaned.rfind("}")
+    if start != -1 and end > start:
+        try:
+            parsed = json.loads(cleaned[start:end + 1])
+            if isinstance(parsed, dict):
+                return parsed
+        except json.JSONDecodeError:
+            pass
+
+    # 3. Object-by-object from top level.
+    objects = _extract_objects(cleaned)
+    if objects:
+        if "review" in objects[0]:
+            return objects[0]
+        return {"review": objects}
+
+    # 4. Scan inside the "review": [ array directly. This handles the case where
+    # the outer object is never closed because the model was cut off mid-entry.
+    arr_match = re.search(r'"review"\s*:\s*\[', cleaned)
+    if arr_match:
+        entries = _extract_objects(cleaned[arr_match.end() - 1:])
+        if entries:
+            return {"review": entries}
+
+    return None
+
+
+class TextReviewStage(ReviewStage):
+    """ReviewStage variant that uses plain-text JSON output instead of tool calling.
+
+    Identical selection logic and prompt as the SDK's ReviewStage, but the
+    system prompt instructs the model to emit a raw JSON object in its reply
+    rather than invoking the submit_review tool. This sidesteps Gemini's
+    MALFORMED_FUNCTION_CALL behaviour entirely.
+    """
+
+    @property
+    def name(self) -> str:
+        return "review"
+
+    def _generate_review(
+        self,
+        candidates: Sequence[CandidateMarket],
+        tick_ctx: TickContext,
+    ) -> dict:
+        candidates_text = "\n".join(
+            f"{m.market_id} | {m.question[:80]} | "
+            f"{m.yes_bid:.2f}/{m.yes_ask:.2f} | ${m.volume_24h:.0f}"
+            for m in candidates
+        )
+
+        positions_text = format_portfolio_summary(tick_ctx, include_positions=True)
+        memory_summary = getattr(tick_ctx, "memory_summary", "") or ""
+        memory_block = (
+            f"\n\nRECENT MEMORY:\n{memory_summary}" if memory_summary else ""
+        )
+        logger.info(
+            "Review prompt memory_in_prompt=%s memory_chars=%d",
+            bool(memory_block),
+            len(memory_summary),
+        )
+
+        system_prompt = f"""\
+You are a prediction market analyst selecting markets for detailed analysis.
+
+HOW PREDICTION MARKETS WORK:
+- Price = probability (0.50 = 50% chance of YES)
+- BUY YES at 0.40: profit if event happens (you think >40% likely)
+- BUY NO at 0.40: profit if event does NOT happen (you think <40% likely)
+- Spread between bid/ask indicates liquidity
+
+Review ALL {len(candidates)} markets and select up to {self.max_markets} \
+for deeper research.
+
+GOOD REASONS TO SELECT:
+- You have domain knowledge about the topic
+- Recent news/events may not be fully priced in
+- The probability seems off based on base rates or logic
+- High volume indicates active trading interest
+
+SKIP markets where:
+- Price is below 0.10 or above 0.90 (near resolution, limited upside)
+- You have no way to research or form a view
+- Question is too vague or ambiguous
+
+OUTPUT RULES — read carefully:
+- Output ONLY a JSON object. No prose, no markdown fences, no function calls.
+- Start your response with {{ and end with }}
+- Use this exact schema:
+{{
+  "review": [
+    {{
+      "market_id": "<exact ID from the list>",
+      "priority": <integer, 1 = highest priority>,
+      "queries": ["<web search query>", "<web search query>", "<web search query>"],
+      "rationale": "<one concise sentence>"
+    }}
+  ]
+}}"""
+
+        user_prompt = (
+            f"Current tick: {tick_ctx.tick_ts}\n"
+            f"Cash available: ${float(tick_ctx.cash):,.0f}\n"
+            f"{positions_text}\n"
+            f"All {len(candidates)} candidate markets "
+            f"(ID | Question | Bid/Ask | 24h Volume):\n"
+            f"{candidates_text}\n\n"
+            f"Select up to {self.max_markets} markets worth researching."
+            f"{memory_block}"
+        )
+
+        messages = [
+            LLMMessage(role="system", content=system_prompt),
+            LLMMessage(role="user", content=user_prompt),
+        ]
+
+        response = self.llm_client.generate(
+            LLMRequest(messages=messages, max_tokens=8192)
+        )
+        text = response.content or ""
+
+        logger.debug("TextReview raw response: %d chars", len(text))
+
+        parsed = _parse_review_json(text)
+        if parsed is None:
+            logger.error(
+                "TextReview: could not parse JSON from response: %.200s", text
+            )
+            return {"review": []}
+
+        raw_list = parsed.get("review", [])
+        if not isinstance(raw_list, list):
+            logger.error("TextReview: 'review' value is not a list")
+            return {"review": []}
+
+        valid: list[dict] = []
+        for item in raw_list:
+            if not isinstance(item, dict):
+                continue
+            mid = item.get("market_id")
+            queries = item.get("queries")
+            if not mid or not isinstance(queries, list) or not queries:
+                continue
+            valid.append({
+                "market_id":  str(mid),
+                "priority":   int(item.get("priority", len(valid) + 1)),
+                "queries":    [str(q) for q in queries if q],
+                "rationale":  str(item.get("rationale", "")),
+            })
+
+        logger.info("TextReview: recovered %d markets from full JSON output", len(valid))
+        return {"review": valid}

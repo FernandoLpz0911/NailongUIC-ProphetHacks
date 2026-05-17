@@ -29,6 +29,7 @@ from agent.settings import RuntimeConfig, load as load_runtime
 from agent.stages.calibrated_forecast import CalibratedForecastStage
 from agent.stages.retrieval_search import RetrievalSearchClient
 from agent.stages.risk_action import RiskAwareActionStage
+from agent.stages.text_review import TextReviewStage
 
 logger = logging.getLogger(__name__)
 
@@ -107,11 +108,13 @@ def build_custom_pipeline(
     )
 
     # ------------------------------------------------------------------
-    # Swap in our custom Forecast and Action stages.
+    # Swap in our custom stages.
     # AgentPipeline.stages is a list of 4: [Review, Search, Forecast, Action].
-    # We keep Review (LLM picks markets) and Search (uses our retrieval),
-    # and override the last two with our calibration/risk logic.
     # ------------------------------------------------------------------
+    pipeline.stages[0] = TextReviewStage(
+        llm_client=llm_client,
+        max_markets=pipeline_config["max_markets"],
+    )
     pipeline.stages[2] = CalibratedForecastStage(
         llm_client=llm_client,
         calibration=runtime.calibration,
