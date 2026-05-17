@@ -3,7 +3,7 @@ name: Nailong Autorun
 on:
   push:
     branches:
-      - www-2
+      - AutoRun
   workflow_dispatch:
 
 # Each run gets its own slug so concurrent builds never fight over a tick lease.
