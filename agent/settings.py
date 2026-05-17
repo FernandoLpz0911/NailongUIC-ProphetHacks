@@ -111,7 +111,12 @@ class TradingConstraints:
 
 @dataclass(frozen=True)
 class CalibrationConfig:
-    """Knobs for the market-anchoring blend in agent/calibration.py."""
+    """Knobs for the market-anchoring blend in agent/calibration.py.
+
+    Conservative fallback defaults that keep the test suite green. Production
+    runtime overrides are in `.env` — they're tuned for Sharpe-first behavior
+    (stronger market anchor, tighter deviation cap).
+    """
 
     alpha_high: float = field(default_factory=lambda: _env_float("ALPHA_HIGH", 0.7))
     alpha_medium: float = field(default_factory=lambda: _env_float("ALPHA_MEDIUM", 0.5))
@@ -128,7 +133,12 @@ class CalibrationConfig:
 
 @dataclass(frozen=True)
 class RiskConfig:
-    """Knobs for the risk-aware action stage."""
+    """Knobs for the risk-aware action stage.
+
+    Conservative fallback defaults that keep the test suite green. Production
+    runtime overrides are in `.env` — they're tuned for Sharpe-first behavior
+    (smaller Kelly, tighter gates, faster TP/SL, broader diversification).
+    """
 
     min_conf_model: float = field(default_factory=lambda: _env_float("MIN_CONF_MODEL", 0.20))
     min_edge: float = field(default_factory=lambda: _env_float("MIN_EDGE", 0.05))
@@ -181,7 +191,8 @@ class RiskConfig:
     )
     # Forecast-driven flip-as-sell may not fire on a position younger than
     # this many ticks. Take-profit and stop-loss exits are unaffected.
-    # Default 0 keeps existing behavior; tune up in `.env` to dampen churn.
+    # Default 0 keeps existing behavior; production .env overrides to 4
+    # (~1 hour at 15-min cadence) to dampen Sharpe-killing churn.
     min_dwell_ticks: int = field(
         default_factory=lambda: _env_int("POSITION_MIN_DWELL_TICKS", 0)
     )
@@ -200,6 +211,17 @@ class RuntimeConfig:
     pa_server_api_key: str | None = field(default_factory=lambda: os.getenv("PA_SERVER_API_KEY") or None)
     openrouter_api_key: str | None = field(default_factory=lambda: os.getenv("OPENROUTER_API_KEY") or None)
     brave_api_key: str | None = field(default_factory=lambda: os.getenv("BRAVE_API_KEY") or None)
+    tavily_api_key: str | None = field(default_factory=lambda: os.getenv("TAVILY_API_KEY") or None)
+
+    cost_db_path: str = field(default_factory=lambda: os.getenv("COST_DB_PATH", "./costs.sqlite"))
+    kill_switch_usd: float = field(default_factory=lambda: _env_float("KILL_SWITCH_USD", 180.0))
+    log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
+
+
+def load() -> RuntimeConfig:
+    """Factory; tests may construct RuntimeConfig directly with overrides."""
+    return RuntimeConfig()
+)
     tavily_api_key: str | None = field(default_factory=lambda: os.getenv("TAVILY_API_KEY") or None)
 
     cost_db_path: str = field(default_factory=lambda: os.getenv("COST_DB_PATH", "./costs.sqlite"))

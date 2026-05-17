@@ -142,7 +142,7 @@ Override any `RuntimeConfig` field by setting the matching env var (see
 ```
 python -m agent.run [OPTIONS]
 
-  -m, --models TEXT          Repeatable. Default: openrouter:anthropic/claude-sonnet-4
+  -m, --models TEXT          Repeatable. Default: anthropic/claude-opus-4.7 (via OpenRouter)
   -s, --slug TEXT            Experiment slug. Default: nailong_v01
   -r, --replicates INT       Replicates per model. Default: 1
   -t, --max-ticks INT        Default: 1344 (= 14 days x 96 ticks/day)
