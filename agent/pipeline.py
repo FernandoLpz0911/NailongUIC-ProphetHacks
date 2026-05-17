@@ -40,7 +40,8 @@ def _split_model_spec(model_spec: str) -> tuple[str, str]:
     if ":" in model_spec:
         provider, model_name = model_spec.split(":", 1)
         return provider, model_name
-    return "openai", model_spec
+    # Bare "org/model" slugs (OpenRouter, etc.) — same convention as SDK CLI.
+    return "openrouter", model_spec
 
 
 def build_custom_pipeline(

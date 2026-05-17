@@ -41,6 +41,7 @@ _OPENAI_COMPAT_BASE_URLS: dict[str, str] = {
     "openrouter": "https://openrouter.ai/api/v1",
     "xai": "https://api.x.ai/v1",
     "grok": "https://api.x.ai/v1",
+    "openai": "https://api.openai.com/v1",
 }
 
 
