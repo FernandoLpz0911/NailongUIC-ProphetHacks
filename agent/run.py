@@ -9,7 +9,7 @@ Defaults are tuned for the 14-day eval window:
   --slug      nailong_v01
   --max-ticks 1344   (14 days * 24h * 4 ticks/h)
   --starting-cash 10000 (matches INITIAL_CASH from constants.csv)
-  -m          gemini:gemini-2.0-pro
+  -m          gemini:gemini-2.5-pro
 
 Use --dry to wire everything up but skip `runner.run()` so you can verify
 the build_pipeline closure resolves credentials without burning a tick lease.
@@ -46,7 +46,7 @@ def _setup_logging(verbose: bool, log_level: str) -> None:
 @click.command()
 @click.option(
     "-m", "--models", multiple=True,
-    default=("gemini:gemini-2.0-pro",),
+    default=("gemini:gemini-2.5-pro",),
     show_default=True,
     help="Model specs (provider:model). Repeatable.",
 )
