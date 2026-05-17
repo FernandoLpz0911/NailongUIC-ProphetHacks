@@ -46,13 +46,13 @@ def _setup_logging(verbose: bool, log_level: str) -> None:
 @click.command()
 @click.option(
     "-m", "--models", multiple=True,
-    default=("gemini-3.5-pro",),
+    default=("gemini:gemini-2.5-flash",),
     show_default=True,
     help="Model specs (provider:model). Repeatable.",
 )
 @click.option(
     "-s", "--slug",
-    default="nailong_v01", show_default=True,
+    default="eval_nailonguic", show_default=True,
     help="Experiment slug (stable across restarts).",
 )
 @click.option(
@@ -60,8 +60,8 @@ def _setup_logging(verbose: bool, log_level: str) -> None:
     help="Replicates per model.",
 )
 @click.option(
-    "-t", "--max-ticks", type=int, default=1344, show_default=True,
-    help="Target completed ticks. Default = 14 days x 96 ticks/day.",
+    "-t", "--max-ticks", type=int, default=1500, show_default=True,
+    help="Target completed ticks. 1500 covers the 14-day eval window (1344 max) with buffer.",
 )
 @click.option(
     "--starting-cash", type=float, default=None,
