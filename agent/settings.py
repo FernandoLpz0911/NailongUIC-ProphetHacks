@@ -149,6 +149,43 @@ class RiskConfig:
     stop_loss_threshold: float = field(
         default_factory=lambda: _env_float("STOP_LOSS_THRESHOLD", 0.10)
     )
+    # ------------------------------------------------------------------
+    # Nailong Elite — duration-aware sizing and concentration controls.
+    # ------------------------------------------------------------------
+    # Duration penalty: size *= 1 / (1 + days_to_resolution / half_life_days).
+    # Half-life of 90 days means 3mo markets get full size, 3yr markets get ~8%.
+    duration_half_life_days: float = field(
+        default_factory=lambda: _env_float("DURATION_HALF_LIFE_DAYS", 90.0)
+    )
+    # Long-dated cap: cumulative size on markets resolving >180 days out cannot
+    # exceed this fraction of equity. Live data showed 100% capital tied up in
+    # 2028-2029 markets that won't resolve during the 14-day eval window.
+    long_dated_threshold_days: float = field(
+        default_factory=lambda: _env_float("LONG_DATED_THRESHOLD_DAYS", 180.0)
+    )
+    long_dated_max_share: float = field(
+        default_factory=lambda: _env_float("LONG_DATED_MAX_SHARE", 0.30)
+    )
+    # Same-event concentration cap: combined exposure on markets sharing an
+    # event prefix (e.g. all KXDEMPRIMARY-2028-* markets are the same election).
+    same_event_max_notional: float = field(
+        default_factory=lambda: _env_float("SAME_EVENT_MAX_NOTIONAL", 300.0)
+    )
+    # Loosen the deviation cap when both ensemble confidence and retrieval
+    # confidence are high. Paper §4.2.3: LLMs are systematically conservative,
+    # so high-conviction extremes are more often right.
+    conf_deviation_cap: float = field(
+        default_factory=lambda: _env_float("CONF_DEVIATION_CAP", 0.40)
+    )
+    conf_high_threshold: float = field(
+        default_factory=lambda: _env_float("CONF_HIGH_THRESHOLD", 0.85)
+    )
+    # When to relax the min-edge gate. Was previously "always if total_fills<14",
+    # which over-traded on Day 1. Now: only when we have fewer than this many
+    # ticks remaining AND still below the trade floor.
+    final_stretch_ticks: int = field(
+        default_factory=lambda: _env_int("FINAL_STRETCH_TICKS", 100)
+    )
 
 
 @dataclass(frozen=True)
@@ -168,6 +205,18 @@ class RuntimeConfig:
     cost_db_path: str = field(default_factory=lambda: os.getenv("COST_DB_PATH", "./costs.sqlite"))
     kill_switch_usd: float = field(default_factory=lambda: _env_float("KILL_SWITCH_USD", 180.0))
     log_level: str = field(default_factory=lambda: os.getenv("LOG_LEVEL", "INFO"))
+
+    # Total target ticks for the eval window. Used by the action stage's
+    # min-edge relaxation logic to know when we're in the "final stretch".
+    # Default 1500 matches the hackathon-required value (1344 + buffer).
+    target_total_ticks: int = field(
+        default_factory=lambda: _env_int("TARGET_TOTAL_TICKS", 1500)
+    )
+
+    # Structured per-tick / per-fill / per-resolution JSONL paths.
+    decision_log_dir: str = field(
+        default_factory=lambda: os.getenv("DECISION_LOG_DIR", "./data/decisions")
+    )
 
 
 def load() -> RuntimeConfig:
