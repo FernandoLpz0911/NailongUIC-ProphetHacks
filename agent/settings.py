@@ -132,6 +132,12 @@ class RiskConfig:
     )
     min_intent_size_usd: float = field(default_factory=lambda: _env_float("MIN_INTENT_SIZE_USD", 5.0))
     trade_floor_count: int = field(default_factory=lambda: _env_int("TRADE_FLOOR_COUNT", 14))
+    take_profit_threshold: float = field(
+        default_factory=lambda: _env_float("TAKE_PROFIT_THRESHOLD", 0.25)
+    )
+    stop_loss_threshold: float = field(
+        default_factory=lambda: _env_float("STOP_LOSS_THRESHOLD", 0.20)
+    )
 
 
 @dataclass(frozen=True)

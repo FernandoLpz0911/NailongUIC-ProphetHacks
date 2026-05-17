@@ -329,6 +329,239 @@ def test_no_forecasts_returns_empty_success():
 
 
 # ---------------------------------------------------------------------------
+# Take-profit (mechanical SELL when mark >= entry * 1.25)
+# ---------------------------------------------------------------------------
+
+def test_take_profit_fires_when_gain_exceeds_threshold():
+    m = make_market("M1", yes_bid=0.75, yes_ask=0.78)
+    # Bought YES at 0.50, now marks 0.75 -> +50% gain, well over 25%.
+    from dataclasses import replace as dc_replace
+    held = dc_replace(
+        make_position("M1", "YES", shares=100.0, avg_entry=0.50),
+        current_price=Decimal("0.75"),
+    )
+    tick = make_tick(candidates=[m], positions=[held])
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result({}))
+
+    assert len(out.data["intents"]) == 1
+    intent = out.data["intents"][0]
+    assert intent["action"] == "SELL"
+    assert intent["side"] == "YES"
+    assert float(intent["shares"]) == 100.0
+
+
+def test_take_profit_does_not_fire_below_threshold():
+    m = make_market("M1", yes_bid=0.60, yes_ask=0.63)
+    # Bought YES at 0.50, now marks 0.60 -> +20% gain, under the 25% threshold.
+    held = make_position("M1", "YES", shares=50.0, avg_entry=0.50)
+    from dataclasses import replace as dc_replace
+    held = dc_replace(held, current_price=Decimal("0.60"))
+    tick = make_tick(candidates=[m], positions=[held])
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result({}))
+
+    assert out.data["intents"] == []
+
+
+def test_take_profit_fires_on_no_side():
+    m = make_market("M1", yes_bid=0.30, yes_ask=0.33)
+    # Bought NO at 0.55 (1 - yes_ask=0.45), now NO marks 0.70 -> +27% gain.
+    held = make_position("M1", "NO", shares=80.0, avg_entry=0.55)
+    from dataclasses import replace as dc_replace
+    held = dc_replace(held, current_price=Decimal("0.70"))
+    tick = make_tick(candidates=[m], positions=[held])
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result({}))
+
+    assert len(out.data["intents"]) == 1
+    assert out.data["intents"][0]["side"] == "NO"
+
+
+def test_take_profit_precedes_forecast_buys():
+    # Take-profit SELL on M1, plus a new BUY forecast on M2 -> SELL listed first.
+    tp_market = make_market("M1", yes_bid=0.75, yes_ask=0.78)
+    new_market = make_market("M2", yes_bid=0.36, yes_ask=0.40)
+    from dataclasses import replace as dc_replace
+    held = make_position("M1", "YES", shares=100.0, avg_entry=0.50)
+    held = dc_replace(held, current_price=Decimal("0.75"))
+    tick = make_tick(candidates=[tp_market, new_market], positions=[held])
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result({"M2": {"p_yes": 0.60, "rationale": ""}}))
+
+    actions = [(i["market_id"], i["action"]) for i in out.data["intents"]]
+    assert ("M1", "SELL") in actions
+    assert ("M2", "BUY") in actions
+    assert actions.index(("M1", "SELL")) < actions.index(("M2", "BUY"))
+
+
+def test_take_profit_skips_market_from_forecast_loop():
+    # If take-profit fires on M1, the forecast loop should not also BUY M1.
+    m = make_market("M1", yes_bid=0.75, yes_ask=0.78)
+    from dataclasses import replace as dc_replace
+    held = make_position("M1", "YES", shares=100.0, avg_entry=0.50)
+    held = dc_replace(held, current_price=Decimal("0.75"))
+    tick = make_tick(candidates=[m], positions=[held])
+
+    # Forecast says M1 is still a good BUY; take-profit should override.
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result({"M1": {"p_yes": 0.90, "rationale": ""}}))
+
+    assert len(out.data["intents"]) == 1
+    assert out.data["intents"][0]["action"] == "SELL"
+
+
+def test_take_profit_threshold_configurable():
+    m = make_market("M1", yes_bid=0.63, yes_ask=0.66)
+    from dataclasses import replace as dc_replace
+    held = make_position("M1", "YES", shares=50.0, avg_entry=0.50)
+    held = dc_replace(held, current_price=Decimal("0.63"))
+    tick = make_tick(candidates=[m], positions=[held])
+
+    # Default 25% threshold: +26% gain should fire.
+    stage_default = make_stage()
+    out_default = stage_default.execute(tick, forecast_result({}))
+    assert len(out_default.data["intents"]) == 1
+
+    # Custom 40% threshold: +26% gain should NOT fire.
+    from agent.settings import RiskConfig
+    stage_high = RiskAwareActionStage(
+        llm_client=None,
+        constraints=TradingConstraints(),
+        risk=RiskConfig(take_profit_threshold=0.40),
+    )
+    out_high = stage_high.execute(tick, forecast_result({}))
+    assert out_high.data["intents"] == []
+
+
+# ---------------------------------------------------------------------------
+# Stop-loss (mechanical SELL when mark <= entry * (1 - threshold))
+# ---------------------------------------------------------------------------
+
+def test_stop_loss_fires_when_loss_exceeds_threshold():
+    m = make_market("M1", yes_bid=0.35, yes_ask=0.38)
+    # Bought YES at 0.50, now marks 0.35 -> -30% loss, over 20% threshold.
+    from dataclasses import replace as dc_replace
+    held = dc_replace(
+        make_position("M1", "YES", shares=100.0, avg_entry=0.50),
+        current_price=Decimal("0.35"),
+    )
+    tick = make_tick(candidates=[m], positions=[held])
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result({}))
+
+    assert len(out.data["intents"]) == 1
+    intent = out.data["intents"][0]
+    assert intent["action"] == "SELL"
+    assert intent["side"] == "YES"
+    assert "Stop-loss" in intent["rationale"]
+
+
+def test_stop_loss_does_not_fire_below_threshold():
+    m = make_market("M1", yes_bid=0.42, yes_ask=0.45)
+    # Bought YES at 0.50, now marks 0.42 -> -16% loss, under 20% threshold.
+    from dataclasses import replace as dc_replace
+    held = dc_replace(
+        make_position("M1", "YES", shares=50.0, avg_entry=0.50),
+        current_price=Decimal("0.42"),
+    )
+    tick = make_tick(candidates=[m], positions=[held])
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result({}))
+
+    assert out.data["intents"] == []
+
+
+def test_stop_loss_fires_on_no_side():
+    m = make_market("M1", yes_bid=0.68, yes_ask=0.72)
+    # Bought NO at 0.55 (no_ask = 1 - yes_bid = 0.32? let's use a direct value).
+    # entry=0.55, mark=0.40 -> -27% loss.
+    from dataclasses import replace as dc_replace
+    held = dc_replace(
+        make_position("M1", "NO", shares=80.0, avg_entry=0.55),
+        current_price=Decimal("0.40"),
+    )
+    tick = make_tick(candidates=[m], positions=[held])
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result({}))
+
+    assert len(out.data["intents"]) == 1
+    assert out.data["intents"][0]["side"] == "NO"
+
+
+def test_stop_loss_skips_market_from_forecast_loop():
+    m = make_market("M1", yes_bid=0.35, yes_ask=0.38)
+    from dataclasses import replace as dc_replace
+    held = dc_replace(
+        make_position("M1", "YES", shares=100.0, avg_entry=0.50),
+        current_price=Decimal("0.35"),
+    )
+    tick = make_tick(candidates=[m], positions=[held])
+
+    # Even if the forecast still says BUY, stop-loss should prevent re-buy this tick.
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result({"M1": {"p_yes": 0.60, "rationale": ""}}))
+
+    assert len(out.data["intents"]) == 1
+    assert out.data["intents"][0]["action"] == "SELL"
+
+
+def test_stop_loss_threshold_configurable():
+    m = make_market("M1", yes_bid=0.42, yes_ask=0.45)
+    from dataclasses import replace as dc_replace
+    held = dc_replace(
+        make_position("M1", "YES", shares=50.0, avg_entry=0.50),
+        current_price=Decimal("0.42"),
+    )
+    tick = make_tick(candidates=[m], positions=[held])
+
+    # Default 20% threshold: -16% loss should NOT fire.
+    stage_default = make_stage()
+    assert stage_default.execute(tick, forecast_result({})).data["intents"] == []
+
+    # Custom 15% threshold: -16% loss SHOULD fire.
+    from agent.settings import RiskConfig
+    stage_tight = RiskAwareActionStage(
+        llm_client=None,
+        constraints=TradingConstraints(),
+        risk=RiskConfig(stop_loss_threshold=0.15),
+    )
+    out = stage_tight.execute(tick, forecast_result({}))
+    assert len(out.data["intents"]) == 1
+    assert out.data["intents"][0]["action"] == "SELL"
+
+
+def test_stop_loss_and_take_profit_independent():
+    # Two positions: one hits take-profit, one hits stop-loss. Both should fire.
+    tp_market = make_market("TP", yes_bid=0.75, yes_ask=0.78)
+    sl_market = make_market("SL", yes_bid=0.35, yes_ask=0.38)
+    from dataclasses import replace as dc_replace
+    tp_pos = dc_replace(
+        make_position("TP", "YES", shares=100.0, avg_entry=0.50),
+        current_price=Decimal("0.75"),
+    )
+    sl_pos = dc_replace(
+        make_position("SL", "YES", shares=80.0, avg_entry=0.50),
+        current_price=Decimal("0.35"),
+    )
+    tick = make_tick(candidates=[tp_market, sl_market], positions=[tp_pos, sl_pos])
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result({}))
+
+    assert len(out.data["intents"]) == 2
+    market_ids = {i["market_id"] for i in out.data["intents"]}
+    assert market_ids == {"TP", "SL"}
+
+
+# ---------------------------------------------------------------------------
 # Category concentration cap
 # ---------------------------------------------------------------------------
 

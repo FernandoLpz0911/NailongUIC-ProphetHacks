@@ -82,12 +82,6 @@ class RiskAwareActionStage(ActionStage):
         forecasts: dict[str, dict[str, Any]] = (
             previous_results["forecast"].data.get("forecasts", {}) or {}
         )
-        if not forecasts:
-            return StageResult(
-                stage_name=self.name, success=True,
-                data={"intents": [], "decisions": {}},
-            )
-
         # Decide effective min_edge for this tick.
         min_edge = self._effective_min_edge(tick_ctx)
         equity = float(tick_ctx.equity)
@@ -149,12 +143,29 @@ class RiskAwareActionStage(ActionStage):
         new_positions_opened = 0
         category_counts: dict[str, int] = {}
 
+        # 1. Mechanical exits — take-profit and stop-loss before forecast BUYs.
+        tp_scored, tp_handled = self._take_profit_intents(tick_ctx)
+        sl_scored, sl_handled = self._stop_loss_intents(tick_ctx)
+        exit_handled = tp_handled | sl_handled
+        for d in tp_scored + sl_scored:
+            if len(intents) >= self.constraints.max_trades_per_tick:
+                logger.info("Action: mechanical exit blocked by MAX_TRADES_PER_TICK")
+                break
+            intent = self._to_intent(d, tick_ctx, equity_now=equity)
+            if intent is None:
+                continue
+            intents.append(intent)
+            decisions[d["market_id"]] = self._decision_summary(d, equity_now=equity)
+
+        # 2. Forecast-based BUYs (and flip-as-sell).
         for d in scored:
             if len(intents) >= self.constraints.max_trades_per_tick:
                 logger.info("Action: hit MAX_TRADES_PER_TICK=%d", self.constraints.max_trades_per_tick)
                 break
 
             mid = d["market_id"]
+            if mid in exit_handled:
+                continue  # already exited mechanically this tick
             is_new_position = mid not in existing_market_ids
 
             if is_new_position and n_open_positions + new_positions_opened >= self.constraints.max_open_positions:
@@ -198,9 +209,10 @@ class RiskAwareActionStage(ActionStage):
                 new_positions_opened += 1
 
         logger.info(
-            "Action stage complete: %d intents from %d forecasts "
+            "Action stage complete: %d intents (%d tp-sells, %d sl-sells, %d forecasts) "
             "(min_edge=%.3f, gross_notional=$%.0f)",
-            len(intents), len(forecasts), min_edge, running_notional,
+            len(intents), len(tp_scored), len(sl_scored),
+            len(forecasts), min_edge, running_notional,
         )
 
         return StageResult(
@@ -368,6 +380,119 @@ class RiskAwareActionStage(ActionStage):
                 )
                 return relaxed
         return self.risk.min_edge
+
+    def _take_profit_intents(
+        self, tick_ctx: TickContext
+    ) -> tuple[list[dict[str, Any]], set[str]]:
+        """Return scored dicts for positions with >= take_profit_threshold gain.
+
+        Uses the same dict shape as _score_market so _to_intent and
+        _decision_summary can consume them without special-casing.
+        """
+        scored: list[dict[str, Any]] = []
+        handled: set[str] = set()
+        threshold = self.risk.take_profit_threshold
+
+        for pos in tick_ctx.positions:
+            entry = float(pos.avg_entry_price)
+            mark = float(pos.current_price)
+            if entry <= 0:
+                continue
+            gain_pct = (mark - entry) / entry
+            if gain_pct < threshold:
+                continue
+
+            market_info = tick_ctx.get_candidate(pos.market_id)
+            if market_info is not None:
+                sell_price = (
+                    float(market_info.yes_bid) if pos.side == "YES"
+                    else float(market_info.no_bid)
+                )
+                question = market_info.question
+            else:
+                sell_price = mark
+                question = pos.market_id
+
+            if sell_price <= 0:
+                continue
+
+            shares = float(pos.shares)
+            scored.append({
+                "market_id":        pos.market_id,
+                "action":           "SELL",
+                "side":             pos.side,
+                "price":            sell_price,
+                "edge":             gain_pct,
+                "size_usd":         shares * sell_price,
+                "shares":           shares,
+                "rationale": (
+                    f"Take-profit: mark {mark:.3f} vs entry {entry:.3f} "
+                    f"(+{gain_pct:.1%} >= {threshold:.0%} threshold)."
+                ),
+                "question":         question,
+                "is_position_flip": False,
+            })
+            handled.add(pos.market_id)
+
+        if scored:
+            logger.info("Action: %d take-profit sell(s) triggered", len(scored))
+        return scored, handled
+
+    def _stop_loss_intents(
+        self, tick_ctx: TickContext
+    ) -> tuple[list[dict[str, Any]], set[str]]:
+        """Return scored dicts for positions with >= stop_loss_threshold loss.
+
+        Same dict shape as _score_market so _to_intent/_decision_summary work.
+        """
+        scored: list[dict[str, Any]] = []
+        handled: set[str] = set()
+        threshold = self.risk.stop_loss_threshold  # positive, e.g. 0.20
+
+        for pos in tick_ctx.positions:
+            entry = float(pos.avg_entry_price)
+            mark = float(pos.current_price)
+            if entry <= 0:
+                continue
+            loss_pct = (mark - entry) / entry  # negative when a loss
+            if loss_pct > -threshold:
+                continue
+
+            market_info = tick_ctx.get_candidate(pos.market_id)
+            if market_info is not None:
+                sell_price = (
+                    float(market_info.yes_bid) if pos.side == "YES"
+                    else float(market_info.no_bid)
+                )
+                question = market_info.question
+            else:
+                sell_price = mark
+                question = pos.market_id
+
+            if sell_price <= 0:
+                continue
+
+            shares = float(pos.shares)
+            scored.append({
+                "market_id":        pos.market_id,
+                "action":           "SELL",
+                "side":             pos.side,
+                "price":            sell_price,
+                "edge":             abs(loss_pct),
+                "size_usd":         shares * sell_price,
+                "shares":           shares,
+                "rationale": (
+                    f"Stop-loss: mark {mark:.3f} vs entry {entry:.3f} "
+                    f"({loss_pct:.1%} <= -{threshold:.0%} threshold)."
+                ),
+                "question":         question,
+                "is_position_flip": False,
+            })
+            handled.add(pos.market_id)
+
+        if scored:
+            logger.info("Action: %d stop-loss sell(s) triggered", len(scored))
+        return scored, handled
 
     @staticmethod
     def _size_to_shares(size_usd: float, price: float) -> float:
