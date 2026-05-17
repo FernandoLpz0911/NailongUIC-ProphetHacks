@@ -46,7 +46,7 @@ def _setup_logging(verbose: bool, log_level: str) -> None:
 @click.command()
 @click.option(
     "-m", "--models", multiple=True,
-    default=("gemini:gemini-1.5-pro",),
+    default=("gemini-3.5-pro",),
     show_default=True,
     help="Model specs (provider:model). Repeatable.",
 )
