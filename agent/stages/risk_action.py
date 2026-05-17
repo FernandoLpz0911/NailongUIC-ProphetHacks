@@ -250,7 +250,9 @@ class RiskAwareActionStage(ActionStage):
         p_yes = _clamp01(p_yes)
         p_no = 1.0 - p_yes
 
+        yes_bid = float(market.yes_bid)
         yes_ask = float(market.yes_ask)
+        no_bid = float(market.no_bid)
         no_ask = float(market.no_ask)
 
         edge_yes = p_yes - yes_ask if yes_ask > 0 else -1.0
@@ -289,9 +291,7 @@ class RiskAwareActionStage(ActionStage):
                 # Sell down the held side. Price for executing the SELL is
                 # best_bid on the held side (we hit the bid).
                 held_side = existing.side
-                sell_price = (
-                    float(market.yes_bid) if held_side == "YES" else float(market.no_bid)
-                )
+                sell_price = yes_bid if held_side == "YES" else no_bid
                 if sell_price <= 0:
                     return None
                 sell_notional = shares_held * sell_price
@@ -319,6 +319,21 @@ class RiskAwareActionStage(ActionStage):
         # ------------------------------------------------------------------
         if best_price <= 0 or best_price >= 1.0:
             return None  # Degenerate or resolved-near-expiry market.
+
+        # Spread gate: wide spreads eat edge before we're even filled.
+        # Apply only to BUY entries; flip-as-sell exits are exempt.
+        if best_side == "YES":
+            spread_mid = (yes_ask + yes_bid) / 2.0
+            spread_pct = (yes_ask - yes_bid) / spread_mid if spread_mid > 0 else 1.0
+        else:
+            spread_mid = (no_ask + no_bid) / 2.0
+            spread_pct = (no_ask - no_bid) / spread_mid if spread_mid > 0 else 1.0
+        if spread_pct > self.risk.max_spread_pct:
+            logger.debug(
+                "Action: skip %s, spread %.1f%% > max %.1f%%",
+                market_id, spread_pct * 100, self.risk.max_spread_pct * 100,
+            )
+            return None
 
         # Exact binary Kelly: f* = edge / (1 - price), scaled by kelly_fraction.
         # Epistemic shrinkage (James-Stein): reduce when LLM ensemble shows high

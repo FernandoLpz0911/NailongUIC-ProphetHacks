@@ -112,6 +112,68 @@ def make_stage(**risk_overrides) -> RiskAwareActionStage:
 
 
 # ---------------------------------------------------------------------------
+# Bid-ask spread filter
+# ---------------------------------------------------------------------------
+
+def test_wide_spread_buy_skipped():
+    # yes_bid=0.30, yes_ask=0.50 -> spread=0.20, mid=0.40, spread_pct=50% > 15%.
+    m = make_market("M1", yes_bid=0.30, yes_ask=0.50)
+    tick = make_tick(candidates=[m])
+    forecasts = {"M1": {"p_yes": 0.70, "rationale": ""}}
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result(forecasts))
+    assert out.data["intents"] == []
+
+
+def test_tight_spread_buy_passes():
+    # yes_bid=0.36, yes_ask=0.40 -> spread=0.04, mid=0.38, spread_pct=10.5% < 15%.
+    m = make_market("M1", yes_bid=0.36, yes_ask=0.40)
+    tick = make_tick(candidates=[m])
+    forecasts = {"M1": {"p_yes": 0.65, "rationale": ""}}
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result(forecasts))
+    assert len(out.data["intents"]) == 1
+    assert out.data["intents"][0]["action"] == "BUY"
+
+
+def test_spread_filter_configurable():
+    # spread_pct ~10.5%; default 15% passes, tight 8% cap rejects.
+    m = make_market("M1", yes_bid=0.36, yes_ask=0.40)
+    tick = make_tick(candidates=[m])
+    forecasts = {"M1": {"p_yes": 0.65, "rationale": ""}}
+
+    from agent.settings import RiskConfig
+    stage_tight = RiskAwareActionStage(
+        llm_client=None,
+        constraints=TradingConstraints(),
+        risk=RiskConfig(max_spread_pct=0.08),
+    )
+    out = stage_tight.execute(tick, forecast_result(forecasts))
+    assert out.data["intents"] == []
+
+
+def test_spread_filter_does_not_block_flip_as_sell():
+    # Wide spread: yes_bid=0.30, yes_ask=0.70 -> spread_pct=80%.
+    # But we hold YES and forecast flips to NO -> flip-as-sell should still fire.
+    m = make_market("M1", yes_bid=0.30, yes_ask=0.70)
+    from dataclasses import replace as dc_replace
+    held = dc_replace(
+        make_position("M1", "YES", shares=50.0, avg_entry=0.60),
+        current_price=Decimal("0.30"),
+    )
+    tick = make_tick(candidates=[m], positions=[held])
+    forecasts = {"M1": {"p_yes": 0.10, "rationale": "flipped"}}
+
+    stage = make_stage()
+    out = stage.execute(tick, forecast_result(forecasts))
+
+    assert len(out.data["intents"]) == 1
+    assert out.data["intents"][0]["action"] == "SELL"
+
+
+# ---------------------------------------------------------------------------
 # Edge gate
 # ---------------------------------------------------------------------------
 
@@ -165,7 +227,8 @@ def test_buy_no_when_negative_yes_edge_but_positive_no_edge():
 
 def test_size_capped_by_max_position_pct_of_equity():
     # Massive edge would otherwise size higher; we cap at 5% of $10k = $500.
-    m = make_market("M1", yes_bid=0.05, yes_ask=0.10)
+    # yes_bid=0.09 keeps spread_pct ~10.5% so the spread gate doesn't fire.
+    m = make_market("M1", yes_bid=0.09, yes_ask=0.10)
     tick = make_tick(candidates=[m], equity=10_000.0)
     forecasts = {"M1": {"p_yes": 0.95, "rationale": "huge edge"}}
 
@@ -177,7 +240,7 @@ def test_size_capped_by_max_position_pct_of_equity():
 
 def test_size_capped_by_max_notional_per_market_with_large_equity():
     # With huge equity, the 5% cap = $50k, so the $1k per-market cap binds.
-    m = make_market("M1", yes_bid=0.05, yes_ask=0.10)
+    m = make_market("M1", yes_bid=0.09, yes_ask=0.10)
     tick = make_tick(candidates=[m], equity=1_000_000.0)
     forecasts = {"M1": {"p_yes": 0.95, "rationale": "huge edge"}}
 

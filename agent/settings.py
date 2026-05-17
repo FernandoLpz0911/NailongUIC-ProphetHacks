@@ -125,6 +125,9 @@ class RiskConfig:
     # Raw gap gate: minimum |p_model - p_market| before blending required to open a position.
     # Used when the ensemble provides a raw_gap; otherwise min_edge on blended edge applies.
     min_raw_gap: float = field(default_factory=lambda: _env_float("MIN_RAW_GAP", 0.04))
+    max_spread_pct: float = field(
+        default_factory=lambda: _env_float("MAX_SPREAD_PCT", 0.15)
+    )
     # Quarter-Kelly (0.25) is optimal under CRRA utility with rho≈4 and a Sharpe penalty.
     kelly_fraction: float = field(default_factory=lambda: _env_float("KELLY_FRACTION", 0.25))
     max_position_pct_of_equity: float = field(
