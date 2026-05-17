@@ -87,6 +87,14 @@ class RiskAwareActionStage(ActionStage):
         equity = float(tick_ctx.equity)
         existing_market_ids = {p.market_id for p in tick_ctx.positions}
         n_open_positions = len(existing_market_ids)
+        
+        current_port_var = 0.0
+        if equity > 0:
+            for pos in tick_ctx.positions:
+                mark = float(pos.current_price)
+                weight = float(pos.shares * pos.current_price) / equity
+                pos_var = mark * (1.0 - mark)
+                current_port_var += (weight ** 2) * pos_var
 
         # Score every (market, side) opportunity; sort by edge desc so we
         # spend the per-tick budget on the highest-EV ideas first.
@@ -236,6 +244,7 @@ class RiskAwareActionStage(ActionStage):
         min_edge: float,
         raw_gap: float | None = None,
         llm_var: float = 0.0,
+        current_port_var: float = 0.0,  # <-- NEW argument
     ) -> dict[str, Any] | None:
         """Compute (side, edge, sizing) for one market; return None to skip.
 
@@ -315,21 +324,54 @@ class RiskAwareActionStage(ActionStage):
                 }
 
         # ------------------------------------------------------------------
-        # Standard BUY path.
+        # Standard BUY path with Volatility Penalization.
         # ------------------------------------------------------------------
         if best_price <= 0 or best_price >= 1.0:
             return None  # Degenerate or resolved-near-expiry market.
 
-        # Exact binary Kelly: f* = edge / (1 - price), scaled by kelly_fraction.
         # Epistemic shrinkage (James-Stein): reduce when LLM ensemble shows high
         # variance, since σ²_position = p(1-p) + Var(LLM_samples).
         from agent.calibration import epistemic_shrink
         shrink = epistemic_shrink(p_yes, llm_var)
+        
+        # 1. Base Exact Kelly: f* = edge / (1 - price)
+        base_kelly = best_edge / max(1.0 - best_price, 1e-6)
+        
+        # 2. Volatility Penalization (Sharpe Optimization)
+        
+        asset_var = best_price * (1.0 - best_price)
+        asset_std_dev = max(asset_var ** 0.5, 1e-6)
+        
+        # Base dampener: penalizes variance for standard coin-toss bets
+        base_dampener = min(1.0, 0.4 / asset_std_dev)
+        
+        # --- TUNED: The Mid-Curve Sizing Paradox Bypass ---
+        # Adjusted for steady, noticeable PnL generation.
+        # We begin releasing the brakes at an 8% edge (0.08) rather than 15%, 
+        # allowing the agent to capture high-quality (but not perfectly rare) setups.
+        if best_edge > 0.08:
+            # Scales smoothly: begins recovering at 0.08 edge, fully bypasses penalty at 0.33 edge.
+            # A multiplier of 4.0 ensures the transition is steady, preventing sudden 
+            # massive spikes in exposure that would ruin the Sharpe ratio.
+            recovery_factor = min(1.0, (best_edge - 0.08) * 4.0) 
+            sharpe_dampener = base_dampener + ((1.0 - base_dampener) * recovery_factor)
+        else:
+            sharpe_dampener = base_dampener
+        # ------------------------------------------------
+
+        # B. Portfolio-Level Penalty (Heat Check)
+        target_max_var = getattr(self.risk, 'target_portfolio_var', 0.05)
+        heat_penalty = max(0.1, 1.0 - (current_port_var / target_max_var))
+
+        # C. Calculate Adjusted Size
         kelly_frac = (
             self.risk.kelly_fraction
             * shrink
-            * (best_edge / max(1.0 - best_price, 1e-6))
+            * base_kelly
+            * sharpe_dampener  
+            * heat_penalty     
         )
+
         kelly_frac = max(0.0, min(self.risk.max_position_pct_of_equity, kelly_frac))
 
         equity = float(tick_ctx.equity)
@@ -355,15 +397,14 @@ class RiskAwareActionStage(ActionStage):
             "shares":            shares,
             "rationale": (
                 f"edge={best_edge:+.3f} (p_yes={p_yes:.3f}, price={best_price:.3f}); "
-                f"half-Kelly size ${size_usd:.0f} = {kelly_frac:.2%} of ${equity:.0f}. "
-                f"{rationale}"
+                f"adj-Kelly size ${size_usd:.0f} (heat_pen={heat_penalty:.2f}, "
+                f"sharpe_pen={sharpe_dampener:.2f}). {rationale}"
             ).strip(),
             "p_yes":             p_yes,
             "p_no":              p_no,
             "question":          market.question,
             "is_position_flip":  False,
         }
-
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
