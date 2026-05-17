@@ -360,12 +360,67 @@ class GeminiClient(LLMClient):
             pass
 
 
-def _try_salvage_malformed_review(finish_msg: str) -> dict | None:
-    """Try to extract a review array from Gemini's malformed function call output.
+def _extract_complete_json_objects(s: str) -> list[dict]:
+    """Extract every top-level complete JSON object from a (possibly truncated) string.
 
-    Gemini sometimes emits Python-style kwargs (``submit_review(review=[...])``).
-    We bracket-match the JSON array and return ``{"review": [...]}`` if it parses.
-    Returns None on failure.
+    Walks the string tracking brace depth and string/escape state so that
+    partial trailing objects (cut off by Gemini's output limit) are ignored
+    rather than causing a JSONDecodeError on the whole array.
+    """
+    objects: list[dict] = []
+    i = 0
+    while i < len(s):
+        if s[i] != '{':
+            i += 1
+            continue
+        depth = 0
+        in_str = False
+        escaped = False
+        closed_at = -1
+        j = i
+        while j < len(s):
+            c = s[j]
+            if escaped:
+                escaped = False
+            elif c == '\\' and in_str:
+                escaped = True
+            elif c == '"':
+                in_str = not in_str
+            elif not in_str:
+                if c == '{':
+                    depth += 1
+                elif c == '}':
+                    depth -= 1
+                    if depth == 0:
+                        closed_at = j
+                        break
+            j += 1
+        if closed_at == -1:
+            break  # No complete object remains; stop.
+        try:
+            obj = json.loads(s[i:closed_at + 1])
+            if isinstance(obj, dict):
+                objects.append(obj)
+        except json.JSONDecodeError:
+            pass
+        i = closed_at + 1
+    return objects
+
+
+def _try_salvage_malformed_review(finish_msg: str) -> dict | None:
+    """Extract a review list from Gemini's malformed function call output.
+
+    Handles two failure modes that occur in practice:
+    1. Python-style wrapping: ``print(default_api.submit_review(review=[...]))``
+    2. Truncated output: Gemini hits an output limit mid-array
+
+    Strategy:
+    - Find the ``review=[`` anchor.
+    - Try to parse the full array first (fast path, works when not truncated).
+    - Fall back to object-by-object extraction to recover all complete entries
+      from a truncated array.
+
+    Returns None only if no complete review objects can be recovered at all.
     """
     if "review=" not in finish_msg:
         return None
@@ -376,6 +431,8 @@ def _try_salvage_malformed_review(finish_msg: str) -> dict | None:
             return None
 
         json_str = match.group(1)
+
+        # Fast path: try to bracket-match and parse the full array.
         depth, end = 0, 0
         for i, ch in enumerate(json_str):
             if ch == '[':
@@ -386,11 +443,22 @@ def _try_salvage_malformed_review(finish_msg: str) -> dict | None:
                     end = i + 1
                     break
 
-        if end == 0:
-            return None
+        if end > 0:
+            try:
+                return {"review": json.loads(json_str[:end])}
+            except json.JSONDecodeError:
+                pass  # fall through to object-by-object
 
-        review_data = json.loads(json_str[:end])
-        return {"review": review_data}
+        # Slow path: output was truncated — extract whatever complete objects exist.
+        objects = _extract_complete_json_objects(json_str)
+        if objects:
+            logger.info(
+                "Salvaged %d complete review object(s) from truncated Gemini output",
+                len(objects),
+            )
+            return {"review": objects}
+
+        return None
     except (json.JSONDecodeError, AttributeError) as e:
         logger.warning(f"Failed to parse malformed function call: {e}")
         return None

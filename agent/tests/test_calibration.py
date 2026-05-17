@@ -13,6 +13,8 @@ from agent.calibration import (
     blend,
     calibrate,
     cap_deviation,
+    dynamic_alpha,
+    epistemic_shrink,
     market_mid,
     polymarket_consensus,
 )
@@ -169,3 +171,66 @@ def test_calibrate_polymarket_disagreement_falls_back_to_kalshi(cfg):
     assert out.p_anchor == pytest.approx(0.60)
     # alpha=0.5 -> 0.5*0.80 + 0.5*0.60 = 0.70
     assert out.p_final == pytest.approx(0.70)
+
+
+def test_calibrate_includes_raw_gap(cfg):
+    # raw_gap = p_model - p_market regardless of blending.
+    out = calibrate(
+        p_model=0.70, p_market=0.50,
+        confidence="high", market_history=None, config=cfg,
+    )
+    assert out.raw_gap == pytest.approx(0.20)
+
+
+def test_calibrate_uses_dynamic_alpha_when_conf_model_provided(cfg):
+    # With conf_model=1.0 (perfect confidence), dynamic_alpha returns
+    # alpha_medium (no adjustment). Without conf_model, also alpha_medium
+    # for confidence="medium". Results should match.
+    out_static = calibrate(
+        p_model=0.70, p_market=0.50,
+        confidence="medium", market_history=None, config=cfg,
+    )
+    out_dynamic = calibrate(
+        p_model=0.70, p_market=0.50,
+        confidence="medium", market_history=None, config=cfg,
+        conf_model=1.0,
+    )
+    # conf_model=1.0 → adj=0 → alpha=alpha_medium=0.5 → same as static medium.
+    assert out_dynamic.p_final == pytest.approx(out_static.p_final)
+
+
+def test_dynamic_alpha_reduces_model_trust_when_low_confidence(cfg):
+    alpha_high_conf = dynamic_alpha(1.0, config=cfg)
+    alpha_low_conf = dynamic_alpha(0.0, config=cfg)
+    # Lower confidence → smaller model weight.
+    assert alpha_low_conf < alpha_high_conf
+
+
+def test_dynamic_alpha_increases_model_trust_for_low_liquidity(cfg):
+    alpha_liquid = dynamic_alpha(0.5, config=cfg, low_liquidity=False)
+    alpha_illiquid = dynamic_alpha(0.5, config=cfg, low_liquidity=True)
+    assert alpha_illiquid > alpha_liquid
+
+
+def test_dynamic_alpha_clipped_to_bounds(cfg):
+    # Even at extreme inputs, output stays within [0.15, 0.85].
+    assert 0.15 <= dynamic_alpha(0.0, config=cfg) <= 0.85
+    assert 0.15 <= dynamic_alpha(1.0, config=cfg, low_liquidity=True) <= 0.85
+
+
+def test_epistemic_shrink_no_llm_var():
+    # When llm_var=0 (no ensemble), shrink=1.0 — no change to Kelly.
+    assert epistemic_shrink(0.6, 0.0) == pytest.approx(1.0)
+
+
+def test_epistemic_shrink_reduces_with_high_variance():
+    # High LLM variance → shrink < 1.0.
+    p = 0.6
+    naive_var = p * (1 - p)  # 0.24
+    shrink = epistemic_shrink(p, llm_var=naive_var)  # var doubles -> shrink=0.5
+    assert shrink == pytest.approx(0.5)
+
+
+def test_epistemic_shrink_clamps_at_zero_p():
+    # At p=0 or p=1, naive_var=0; shrink should be 1.0 (no Kelly anyway).
+    assert epistemic_shrink(0.0, 0.0) == pytest.approx(1.0)

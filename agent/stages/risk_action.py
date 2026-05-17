@@ -107,6 +107,20 @@ class RiskAwareActionStage(ActionStage):
             except (TypeError, ValueError):
                 p_yes = 0.5
 
+            # raw_gap and llm_var come from the forecast sidecar populated by
+            # CalibratedForecastStage. Falls back gracefully when running under
+            # tests or the SDK base stage (no sidecar entry → no extra gating).
+            from agent.stages.calibrated_forecast import TICK_FORECAST_EXTRAS
+            extras = TICK_FORECAST_EXTRAS.get(market_id, {})
+            raw_gap_val = extras.get("raw_gap")
+            raw_gap: float | None = (
+                float(raw_gap_val) if raw_gap_val is not None else None
+            )
+            try:
+                llm_var = float(extras.get("llm_var", 0.0))
+            except (TypeError, ValueError):
+                llm_var = 0.0
+
             decision = self._score_market(
                 market_id=market_id,
                 p_yes=p_yes,
@@ -114,6 +128,8 @@ class RiskAwareActionStage(ActionStage):
                 market=market_info,
                 tick_ctx=tick_ctx,
                 min_edge=min_edge,
+                raw_gap=raw_gap,
+                llm_var=llm_var,
             )
             if decision is not None:
                 scored.append(decision)
@@ -191,11 +207,18 @@ class RiskAwareActionStage(ActionStage):
         market: CandidateMarket,
         tick_ctx: TickContext,
         min_edge: float,
+        raw_gap: float | None = None,
+        llm_var: float = 0.0,
     ) -> dict[str, Any] | None:
         """Compute (side, edge, sizing) for one market; return None to skip.
 
         Output keys: market_id, action, side, price, edge, size_usd, shares,
         rationale, p_yes, p_no, question, is_position_flip.
+
+        Gate logic (guide §2.2):
+          - When raw_gap is provided (ensemble path): gate on |raw_gap| >= min_raw_gap.
+          - Otherwise (tests / base SDK): gate on blended edge >= min_edge.
+        Sizing uses the blended edge in both cases (conservative Kelly input).
         """
         p_yes = _clamp01(p_yes)
         p_no = 1.0 - p_yes
@@ -216,8 +239,13 @@ class RiskAwareActionStage(ActionStage):
             best_edge = edge_no
             best_price = no_ask
 
-        if best_edge < min_edge:
-            return None  # No real edge, no trade.
+        # Gate: raw-gap (pre-blend) when available; blended edge otherwise.
+        if raw_gap is not None:
+            if abs(raw_gap) < self.risk.min_raw_gap:
+                return None
+        else:
+            if best_edge < min_edge:
+                return None
 
         existing = tick_ctx.get_position(market_id)
 
@@ -265,8 +293,16 @@ class RiskAwareActionStage(ActionStage):
         if best_price <= 0 or best_price >= 1.0:
             return None  # Degenerate or resolved-near-expiry market.
 
-        # Half-Kelly: f = 0.5 * edge / (1 - price). Capped at the position cap.
-        kelly_frac = self.risk.kelly_fraction * (best_edge / max(1.0 - best_price, 1e-6))
+        # Exact binary Kelly: f* = edge / (1 - price), scaled by kelly_fraction.
+        # Epistemic shrinkage (James-Stein): reduce when LLM ensemble shows high
+        # variance, since σ²_position = p(1-p) + Var(LLM_samples).
+        from agent.calibration import epistemic_shrink
+        shrink = epistemic_shrink(p_yes, llm_var)
+        kelly_frac = (
+            self.risk.kelly_fraction
+            * shrink
+            * (best_edge / max(1.0 - best_price, 1e-6))
+        )
         kelly_frac = max(0.0, min(self.risk.max_position_pct_of_equity, kelly_frac))
 
         equity = float(tick_ctx.equity)

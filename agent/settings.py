@@ -110,6 +110,7 @@ class CalibrationConfig:
     polymarket_min_volume_usd: float = field(
         default_factory=lambda: _env_float("POLYMARKET_MIN_VOLUME_USD", 10000.0)
     )
+    llm_ensemble_n: int = field(default_factory=lambda: _env_int("LLM_ENSEMBLE_N", 6))
 
 
 @dataclass(frozen=True)
@@ -118,7 +119,11 @@ class RiskConfig:
 
     min_edge: float = field(default_factory=lambda: _env_float("MIN_EDGE", 0.05))
     min_edge_relaxed: float = field(default_factory=lambda: _env_float("MIN_EDGE_RELAXED", 0.03))
-    kelly_fraction: float = field(default_factory=lambda: _env_float("KELLY_FRACTION", 0.5))
+    # Raw gap gate: minimum |p_model - p_market| before blending required to open a position.
+    # Used when the ensemble provides a raw_gap; otherwise min_edge on blended edge applies.
+    min_raw_gap: float = field(default_factory=lambda: _env_float("MIN_RAW_GAP", 0.04))
+    # Quarter-Kelly (0.25) is optimal under CRRA utility with rho≈4 and a Sharpe penalty.
+    kelly_fraction: float = field(default_factory=lambda: _env_float("KELLY_FRACTION", 0.25))
     max_position_pct_of_equity: float = field(
         default_factory=lambda: _env_float("MAX_POSITION_PCT_OF_EQUITY", 0.05)
     )
