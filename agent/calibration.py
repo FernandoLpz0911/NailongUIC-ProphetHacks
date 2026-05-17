@@ -171,12 +171,20 @@ def calibrate(
     config: CalibrationConfig,
     conf_model: float = 0.0,
     low_liquidity: bool = False,
+    hours_to_resolution: float | None = None,
+    category_alpha: float | None = None,
 ) -> CalibratedForecast:
     """End-to-end blend: pick anchor, blend, clip deviation, return all inputs.
 
     When conf_model > 0 (LLM ensemble available), uses dynamic_alpha() instead
     of the static confidence-string lookup. raw_gap is included in the output
     so the action stage can gate on the pre-blend model deviation.
+
+    category_alpha overrides the computed alpha when the paper's per-category
+    findings warrant it (e.g. Sports: trust market more; Politics: trust LLM more).
+
+    hours_to_resolution decays alpha toward 0 inside the decay window (paper
+    Fig.2: markets incorporate information faster than LLMs near resolution).
     """
     p_model = _clamp01(p_model)
     p_market = _clamp01(p_market)
@@ -185,6 +193,17 @@ def calibrate(
         alpha = dynamic_alpha(conf_model, config=config, low_liquidity=low_liquidity)
     else:
         alpha = alpha_for_confidence(confidence, config)
+
+    # Category override takes precedence over the confidence-derived alpha.
+    if category_alpha is not None:
+        alpha = float(category_alpha)
+
+    # Time-to-resolution decay: ramp alpha from full → 0 over decay_hours.
+    # At hours_to_resolution=0, alpha=0 (pure market). At >= decay_hours, no change.
+    if hours_to_resolution is not None:
+        decay_hours = getattr(config, "resolution_decay_hours", 72.0)
+        time_weight = min(1.0, hours_to_resolution / max(decay_hours, 1.0))
+        alpha = alpha * time_weight
 
     poly = polymarket_consensus(market_history, p_market, config=config)
     if poly is not None:

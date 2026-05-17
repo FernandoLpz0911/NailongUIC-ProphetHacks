@@ -9,7 +9,11 @@ Defaults are tuned for the 14-day eval window:
   --slug      nailong_v01
   --max-ticks 1344   (14 days * 24h * 4 ticks/h)
   --starting-cash 10000 (matches INITIAL_CASH from constants.csv)
+<<<<<<< HEAD
   -m          gemini:gemini-2.5-pro
+=======
+  -m          gemini-3.1-pro-preview
+>>>>>>> claude/elated-hypatia-03a7b3
 
 Use --dry to wire everything up but skip `runner.run()` so you can verify
 the build_pipeline closure resolves credentials without burning a tick lease.
@@ -46,13 +50,13 @@ def _setup_logging(verbose: bool, log_level: str) -> None:
 @click.command()
 @click.option(
     "-m", "--models", multiple=True,
-    default=("gemini:gemini-2.5-pro",),
+    default=("gemini:gemini-2.5-flash",),
     show_default=True,
     help="Model specs (provider:model). Repeatable.",
 )
 @click.option(
     "-s", "--slug",
-    default="nailong_v01", show_default=True,
+    default="eval_nailonguic", show_default=True,
     help="Experiment slug (stable across restarts).",
 )
 @click.option(
@@ -60,8 +64,8 @@ def _setup_logging(verbose: bool, log_level: str) -> None:
     help="Replicates per model.",
 )
 @click.option(
-    "-t", "--max-ticks", type=int, default=1344, show_default=True,
-    help="Target completed ticks. Default = 14 days x 96 ticks/day.",
+    "-t", "--max-ticks", type=int, default=1500, show_default=True,
+    help="Target completed ticks. 1500 covers the 14-day eval window (1344 max) with buffer.",
 )
 @click.option(
     "--starting-cash", type=float, default=None,

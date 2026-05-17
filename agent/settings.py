@@ -113,7 +113,18 @@ class CalibrationConfig:
     polymarket_min_volume_usd: float = field(
         default_factory=lambda: _env_float("POLYMARKET_MIN_VOLUME_USD", 10000.0)
     )
-    llm_ensemble_n: int = field(default_factory=lambda: _env_int("LLM_ENSEMBLE_N", 6))
+    llm_ensemble_n: int = field(default_factory=lambda: _env_int("LLM_ENSEMBLE_N", 2))
+    # Per-category model-trust weights (lower = trust market more).
+    # From paper Fig.5: Politics/Economics benefit most from LLM+search;
+    # Sports/Entertainment benefit least (market is better informed).
+    alpha_politics: float = field(default_factory=lambda: _env_float("ALPHA_POLITICS", 0.60))
+    alpha_economics: float = field(default_factory=lambda: _env_float("ALPHA_ECONOMICS", 0.55))
+    alpha_sports: float = field(default_factory=lambda: _env_float("ALPHA_SPORTS", 0.30))
+    alpha_entertainment: float = field(default_factory=lambda: _env_float("ALPHA_ENTERTAINMENT", 0.20))
+    alpha_science: float = field(default_factory=lambda: _env_float("ALPHA_SCIENCE", 0.45))
+    # Time-to-resolution decay: alpha is multiplied by this ramp.
+    # Paper Fig.2: LLMs lose edge vs market inside 72h of resolution.
+    resolution_decay_hours: float = field(default_factory=lambda: _env_float("RESOLUTION_DECAY_HOURS", 72.0))
 
 
 @dataclass(frozen=True)
@@ -136,7 +147,7 @@ class RiskConfig:
         default_factory=lambda: _env_float("TAKE_PROFIT_THRESHOLD", 0.25)
     )
     stop_loss_threshold: float = field(
-        default_factory=lambda: _env_float("STOP_LOSS_THRESHOLD", 0.20)
+        default_factory=lambda: _env_float("STOP_LOSS_THRESHOLD", 0.10)
     )
 
 

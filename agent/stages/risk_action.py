@@ -137,6 +137,7 @@ class RiskAwareActionStage(ActionStage):
                 min_edge=min_edge,
                 raw_gap=raw_gap,
                 llm_var=llm_var,
+                current_port_var=current_port_var,
             )
             if decision is not None:
                 scored.append(decision)
@@ -410,14 +411,21 @@ class RiskAwareActionStage(ActionStage):
     # ------------------------------------------------------------------
 
     def _effective_min_edge(self, tick_ctx: TickContext) -> float:
-        """Relax min_edge below the floor when on pace to miss 14 fills."""
+        """Relax min_edge only in the final 100 ticks if on pace to miss the 14-fill floor.
+
+        Relaxing from tick 1 (original behavior) means we over-trade on Day 1
+        when there's plenty of time left to accumulate fills naturally.
+        """
         floor = self.risk.trade_floor_count
-        if tick_ctx.total_fills < floor:
+        ticks_remaining = getattr(tick_ctx, "ticks_remaining", None)
+        # Only relax if we're in the final ~100 ticks AND still below the floor.
+        in_final_stretch = ticks_remaining is None or ticks_remaining <= 100
+        if in_final_stretch and tick_ctx.total_fills < floor:
             relaxed = self.risk.min_edge_relaxed
             if relaxed < self.risk.min_edge:
                 logger.info(
-                    "Action: relaxing min_edge %.3f -> %.3f (only %d/%d lifetime fills)",
-                    self.risk.min_edge, relaxed, tick_ctx.total_fills, floor,
+                    "Action: relaxing min_edge %.3f -> %.3f (only %d/%d lifetime fills, %s ticks left)",
+                    self.risk.min_edge, relaxed, tick_ctx.total_fills, floor, ticks_remaining,
                 )
                 return relaxed
         return self.risk.min_edge

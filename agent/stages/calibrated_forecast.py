@@ -164,7 +164,10 @@ class CalibratedForecastStage(ForecastStage):
         p_agg = 1.0 / (1.0 + math.exp(-mean_logit))
 
         std = statistics.stdev(valid)
-        conf_model = max(0.0, min(1.0, 1.0 - std))
+        # 1 - 2*std maps the [0, 0.5] std range to [0, 1] confidence.
+        # Pure 1-std never goes below 0.5 since std <= 0.5 for probs in [0,1],
+        # making the low-confidence alpha branch unreachable.
+        conf_model = max(0.0, min(1.0, 1.0 - 2.0 * std))
         llm_var = statistics.variance(valid)
 
         return float(max(0.0, min(1.0, p_agg))), conf_model, llm_var
@@ -285,7 +288,39 @@ class CalibratedForecastStage(ForecastStage):
         # 6. Low-liquidity flag for dynamic alpha.
         low_liquidity = (market_info.volume_24h or 0.0) < 2000.0
 
-        # 7. Blend, cap deviation, return SDK schema + extra fields for action stage.
+        # 7. Time-to-resolution: paper Fig.2 shows LLM edge decays sharply
+        #    inside 72h of resolution. Compute hours remaining if available.
+        hours_to_resolution: float | None = None
+        close_time = getattr(market_info, "close_time", None) or getattr(market_info, "end_date", None)
+        if close_time is not None:
+            try:
+                import datetime as _dt
+                now = _dt.datetime.now(_dt.timezone.utc)
+                if hasattr(close_time, "tzinfo"):
+                    delta = close_time - now
+                else:
+                    delta = _dt.datetime.fromisoformat(str(close_time)).replace(
+                        tzinfo=_dt.timezone.utc
+                    ) - now
+                hours_to_resolution = max(0.0, delta.total_seconds() / 3600.0)
+            except Exception:
+                pass
+
+        # 8. Category-specific alpha override from paper findings.
+        from agent.stages.text_review import _category as _cat
+        category = _cat(market_id, market_info.question)
+        category_alpha: float | None = None
+        cal = self.calibration
+        _cat_alpha_map = {
+            "Politics":      getattr(cal, "alpha_politics", None),
+            "Economics":     getattr(cal, "alpha_economics", None),
+            "Sports":        getattr(cal, "alpha_sports", None),
+            "Entertainment": getattr(cal, "alpha_entertainment", None),
+            "Science/Tech":  getattr(cal, "alpha_science", None),
+        }
+        category_alpha = _cat_alpha_map.get(category)
+
+        # 9. Blend, cap deviation, return SDK schema + extra fields for action stage.
         result = calibrate(
             p_model=p_model,
             p_market=p_market,
@@ -294,16 +329,21 @@ class CalibratedForecastStage(ForecastStage):
             config=self.calibration,
             conf_model=conf_model,
             low_liquidity=low_liquidity,
+            hours_to_resolution=hours_to_resolution,
+            category_alpha=category_alpha,
         )
 
+        hrs_str = f" hrs_to_res={hours_to_resolution:.1f}" if hours_to_resolution is not None else ""
         calib_note = (
             f"[anchor={'POLY+KALSHI' if result.used_polymarket else 'KALSHI'}"
             f" alpha={result.alpha:.2f}"
+            f" cat={category}"
             f" p_model={result.p_model:.3f}"
             f" p_market={result.p_market:.3f}"
             f" raw_gap={result.raw_gap:+.3f}"
             f" -> p_final={result.p_final:.3f}"
-            f"{' clipped' if result.clipped_to_cap else ''}]"
+            f"{' clipped' if result.clipped_to_cap else ''}"
+            f"{hrs_str}]"
         )
 
         logger.info(
