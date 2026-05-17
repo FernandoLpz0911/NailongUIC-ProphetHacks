@@ -360,6 +360,11 @@ class GeminiClient(LLMClient):
             pass
 
 
+def _strip_trailing_commas(s: str) -> str:
+    """Strip trailing commas before } or ] — Gemini emits Python-style dicts."""
+    return re.sub(r',\s*([}\]])', r'\1', s)
+
+
 def _extract_complete_json_objects(s: str) -> list[dict]:
     """Extract every top-level complete JSON object from a (possibly truncated) string.
 
@@ -398,7 +403,7 @@ def _extract_complete_json_objects(s: str) -> list[dict]:
         if closed_at == -1:
             break  # No complete object remains; stop.
         try:
-            obj = json.loads(s[i:closed_at + 1])
+            obj = json.loads(_strip_trailing_commas(s[i:closed_at + 1]))
             if isinstance(obj, dict):
                 objects.append(obj)
         except json.JSONDecodeError:
@@ -410,17 +415,18 @@ def _extract_complete_json_objects(s: str) -> list[dict]:
 def _try_salvage_malformed_review(finish_msg: str) -> dict | None:
     """Extract a review list from Gemini's malformed function call output.
 
-    Handles two failure modes that occur in practice:
+    Handles three failure modes that occur in practice:
     1. Python-style wrapping: ``print(default_api.submit_review(review=[...]))``
     2. Truncated output: Gemini hits an output limit mid-array
+    3. Python-style trailing commas in dicts: ``{"key": "val",}`` fails json.loads
 
     Strategy:
     - Find the ``review=[`` anchor.
     - Try to parse the full array first (fast path, works when not truncated).
-    - Fall back to object-by-object extraction to recover all complete entries
-      from a truncated array.
+    - Fall back to object-by-object extraction (strips trailing commas).
+    - Last resort: regex-extract market_id + queries pairs from the raw message.
 
-    Returns None only if no complete review objects can be recovered at all.
+    Returns None only if no market data can be recovered at all.
     """
     if "review=" not in finish_msg:
         return None
@@ -445,11 +451,12 @@ def _try_salvage_malformed_review(finish_msg: str) -> dict | None:
 
         if end > 0:
             try:
-                return {"review": json.loads(json_str[:end])}
+                return {"review": json.loads(_strip_trailing_commas(json_str[:end]))}
             except json.JSONDecodeError:
                 pass  # fall through to object-by-object
 
         # Slow path: output was truncated — extract whatever complete objects exist.
+        # _extract_complete_json_objects strips trailing commas before parsing.
         objects = _extract_complete_json_objects(json_str)
         if objects:
             logger.info(
@@ -458,7 +465,32 @@ def _try_salvage_malformed_review(finish_msg: str) -> dict | None:
             )
             return {"review": objects}
 
-        return None
+        # Last resort: regex-extract market_ids and their queries from the raw
+        # finishMessage. This recovers partially-written entries that were cut off
+        # before their closing brace, so the object-by-object path found nothing.
+        market_ids = re.findall(r'"market_id":\s*"([^"]+)"', finish_msg)
+        if not market_ids:
+            return None
+
+        queries_per_market: list[list[str]] = []
+        for q_match in re.finditer(r'"queries":\s*\[([^\]]*)\]', finish_msg):
+            qs = re.findall(r'"([^"]+)"', q_match.group(1))
+            queries_per_market.append(qs)
+
+        logger.info(
+            "Salvage fallback: reconstructing %d minimal review entries from market_id regex",
+            len(market_ids),
+        )
+        return {"review": [
+            {
+                "market_id": mid,
+                "priority": idx + 1,
+                "queries": queries_per_market[idx] if idx < len(queries_per_market) else [mid],
+                "rationale": "salvaged from truncated output",
+            }
+            for idx, mid in enumerate(market_ids)
+        ]}
+
     except (json.JSONDecodeError, AttributeError) as e:
         logger.warning(f"Failed to parse malformed function call: {e}")
         return None

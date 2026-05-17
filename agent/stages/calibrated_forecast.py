@@ -195,8 +195,11 @@ class CalibratedForecastStage(ForecastStage):
                 "rationale": "[KILL_SWITCH] Budget exhausted; anchored to market mid.",
             }
 
-        # 1. Kalshi mid.
+        # 1. Kalshi mid. Try bare ID first, then with kalshi: prefix in case
+        # the review stage stripped it from the model output.
         market_info = tick_ctx.get_candidate(market_id)
+        if market_info is None and not market_id.startswith("kalshi:"):
+            market_info = tick_ctx.get_candidate("kalshi:" + market_id)
         if market_info is None:
             logger.warning(
                 "Forecast: market %s missing from tick_ctx, falling back to super",

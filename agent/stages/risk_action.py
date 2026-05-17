@@ -98,6 +98,10 @@ class RiskAwareActionStage(ActionStage):
         scored: list[dict[str, Any]] = []
         for market_id, forecast in forecasts.items():
             market_info = tick_ctx.get_candidate(market_id)
+            if market_info is None and not market_id.startswith("kalshi:"):
+                market_info = tick_ctx.get_candidate("kalshi:" + market_id)
+                if market_info is not None:
+                    market_id = "kalshi:" + market_id  # normalize for intent submission
             if market_info is None:
                 logger.warning("Action: market %s missing from candidates", market_id)
                 continue
