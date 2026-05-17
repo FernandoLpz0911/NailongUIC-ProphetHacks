@@ -19,8 +19,9 @@ import time
 from typing import Any
 
 from ai_prophet.trade.agent.stages.forecast import ForecastStage
+from ai_prophet.trade.agent.tool_schemas import FORECAST_TOOL
 from ai_prophet.trade.core import TickContext
-from ai_prophet.trade.llm import LLMClient
+from ai_prophet.trade.llm import LLMClient, LLMMessage
 
 from agent.calibration import calibrate, market_mid
 from agent.settings import CalibrationConfig
@@ -108,23 +109,79 @@ class CalibratedForecastStage(ForecastStage):
                 "rationale": "[KILL_SWITCH] Budget exhausted; anchored to market mid.",
             }
 
-        # 1. Run the SDK LLM forecast.
-        raw = super()._generate_forecast(market_id, summary, tick_ctx)
+        # 1. Kalshi mid for this market — needed for calibration and for
+        #    showing context to the LLM (but NOT to anchor it).
+        market_info = tick_ctx.get_candidate(market_id)
+        if market_info is None:
+            logger.warning("Forecast: market %s missing from tick_ctx, falling back to super", market_id)
+            return super()._generate_forecast(market_id, summary, tick_ctx)
+        p_market = market_mid(market_info.yes_bid, market_info.yes_ask)
+        if p_market is None:
+            logger.warning("Forecast: market %s has no usable quote, falling back to super", market_id)
+            return super()._generate_forecast(market_id, summary, tick_ctx)
+
+        # 2. Run our OWN LLM call with a neutral prompt.
+        #    We intentionally bypass super()._generate_forecast() here because
+        #    the SDK base prompt tells the LLM to "stay close to market price,"
+        #    which pre-anchors p_model before our calibration blend runs.
+        #    That double-anchoring collapses the effective edge to near zero.
+        #    Our prompt shows market price as context but does NOT instruct the
+        #    LLM to anchor to it — that anchoring is done by calibrate() below.
+        summary_text = summary.get("summary", "No summary available")
+        key_points = summary.get("key_points") or []
+        open_qs = summary.get("open_questions") or []
+        key_points_text = (
+            "\n".join(f"- {kp}" for kp in key_points) if key_points else "None identified"
+        )
+        open_qs_text = (
+            "\n".join(f"- {q}" for q in open_qs) if open_qs else "None identified"
+        )
+        memory_by_market = getattr(tick_ctx, "memory_by_market", None) or {}
+        market_memory = memory_by_market.get(market_id, "")
+        memory_block = f"\n\nRECENT MEMORY:\n{market_memory}" if market_memory else ""
+
+        system_prompt = (
+            "You are an expert prediction market forecaster.\n\n"
+            "Your task: provide your INDEPENDENT probability estimate that this event resolves YES.\n\n"
+            "GUIDANCE:\n"
+            "- Reason from the research evidence and base rates — not from the market price.\n"
+            "- The market price is shown for reference only. It reflects current consensus,\n"
+            "  which may or may not be correct. Disagree with the market when evidence warrants.\n"
+            "- Give an honest probability: if you think the market is wrong, say so.\n"
+            "- Extremes (p < 0.05 or p > 0.95) require strong, specific evidence.\n"
+            "- When evidence is limited, use an appropriately wide range rather than defaulting\n"
+            "  to the market price.\n\n"
+            "Use the submit_forecast tool with your estimate."
+        )
+
+        user_prompt = (
+            f"Event: {market_info.question}\n"
+            f"Current market price (for context only): {p_market:.1%}\n\n"
+            f"RESEARCH SUMMARY:\n{summary_text}\n\n"
+            f"KEY POINTS:\n{key_points_text}\n\n"
+            f"OPEN QUESTIONS:\n{open_qs_text}"
+            f"{memory_block}"
+        )
+
+        messages = [
+            LLMMessage(role="system", content=system_prompt),
+            LLMMessage(role="user", content=user_prompt),
+        ]
+
+        raw = self.llm_client.generate_json(messages, tool=FORECAST_TOOL)
+
+        # Normalize percentage-style responses (e.g. LLM returns 73 instead of 0.73).
+        if "p_yes" in raw:
+            p = raw["p_yes"]
+            if isinstance(p, (int, float)) and 1.0 < p <= 100.0:
+                logger.warning("Normalizing p_yes %s -> %s for %s", p, p / 100, market_id)
+                raw["p_yes"] = p / 100
+
         try:
             p_model = float(raw.get("p_yes", 0.5))
         except (TypeError, ValueError):
             p_model = 0.5
         rationale = raw.get("rationale") or ""
-
-        # 2. Kalshi mid for this market.
-        market_info = tick_ctx.get_candidate(market_id)
-        if market_info is None:
-            logger.warning("Forecast: market %s missing from tick_ctx, returning raw", market_id)
-            return raw
-        p_market = market_mid(market_info.yes_bid, market_info.yes_ask)
-        if p_market is None:
-            logger.warning("Forecast: market %s has no usable quote, returning raw", market_id)
-            return raw
 
         # 3. Polymarket second-market signal (cached per process).
         poly = _cached_polymarket(market_info.question)
