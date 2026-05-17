@@ -9,7 +9,7 @@ Defaults are tuned for the 14-day eval window:
   --slug      nailong_v01
   --max-ticks 1344   (14 days * 24h * 4 ticks/h)
   --starting-cash 10000 (matches INITIAL_CASH from constants.csv)
-  -m          openrouter:anthropic/claude-sonnet-4 (per .env DEFAULT_MODEL)
+  -m          anthropic/claude-opus-4.7 (implicit openrouter; needs OPENROUTER_API_KEY)
 
 Use --dry to wire everything up but skip `runner.run()` so you can verify
 the build_pipeline closure resolves credentials without burning a tick lease.

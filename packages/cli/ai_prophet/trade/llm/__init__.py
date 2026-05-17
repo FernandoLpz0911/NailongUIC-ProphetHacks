@@ -38,6 +38,7 @@ logger = logging.getLogger(__name__)
 # Known providers that use the OpenAI Chat Completions API.
 # Unknown providers also route here -- set {PROVIDER}_BASE_URL.
 _OPENAI_COMPAT_BASE_URLS: dict[str, str] = {
+    "openrouter": "https://openrouter.ai/api/v1",
     "xai": "https://api.x.ai/v1",
     "grok": "https://api.x.ai/v1",
 }
